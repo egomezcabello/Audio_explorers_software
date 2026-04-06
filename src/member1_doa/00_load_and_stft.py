@@ -44,15 +44,22 @@ logger = setup_logging(__name__)
 def load_and_verify(wav_path: Path) -> np.ndarray:
     """
     Load a WAV file and verify it matches project conventions.
-
-    Returns
-    -------
-    audio : np.ndarray
-        Shape ``(n_samples, 4)`` float64.
     """
     audio, sr = load_multichannel_wav(wav_path)
+    
+    if audio.shape[1] != N_CHANNELS:
+        if audio.shape[0] == N_CHANNELS:
+            audio = audio.T
+        else:
+            raise ValueError(f"Expected {N_CHANNELS} channels, got {audio.shape[1]}")
+
+    logger.info("  Verifying signal levels (RMS):")
+    for i, label in enumerate(CHANNEL_ORDER):
+        rms_val = np.sqrt(np.mean(audio[:, i]**2))
+        logger.info("    Channel %d (%s) RMS: %.4f", i, label, rms_val)
+
     logger.info(
-        "  Channel order assumed: %s | shape: %s | sr: %d",
+        "  Channel order: %s | Shape: %s | SR: %d",
         CHANNEL_ORDER,
         audio.shape,
         sr,
