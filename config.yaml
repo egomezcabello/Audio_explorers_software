@@ -7,7 +7,7 @@
 
 project:
   name: "Audio Explorers – Hearing-Aid Microphone Array Scene Analysis"
-  version: "0.1.0"
+  version: "0.2.0"
 
 audio:
   sample_rate: 44100          # Hz – fixed for all recordings
@@ -18,30 +18,92 @@ audio:
     - "RF"                    # Right-Front
     - "RR"                    # Right-Rear
 
+# ── STFT parameters ────────────────────────────────────────────────────
+# We keep n_fft=1024 / hop=256 (the original scaffold defaults) because
+# they give fine temporal resolution (~5.8 ms per frame) which benefits
+# the frame-level DoA estimation.  A larger n_fft=2048 / hop=512 would
+# improve frequency resolution but halve the number of DoA frames and
+# may blur fast speaker turn-taking.  Downstream members who need
+# coarser STFT can always re-compute from the WAV.
 stft:
   n_fft: 1024
   hop_length: 256
   win_length: 1024
   window: "hann"
 
+# ── DoA estimation ─────────────────────────────────────────────────────
 doa:
-  method: "gcc_phat"          # Options: gcc_phat, srp_phat, music
-  n_grid: 360                 # azimuth grid resolution (degrees)
-  freq_range: [300, 8000]     # Hz – band used for DoA estimation
+  method: "calibrated_srp_phat"   # weighted SRP-PHAT with pair grouping
+  n_grid: 360                     # azimuth bins (1° resolution)
+  freq_range: [300, 8000]         # Hz – speech band for DoA
 
+  # ── Microphone-pair groups ──────────────────────────────────────────
+  # The 4 BTE mics form 6 unique pairs, classified by baseline geometry:
+  #
+  #   on_ear    – same ear, front-rear (12 mm x-axis baseline)
+  #               Best at resolving front vs back.
+  #   lateral   – cross-ear, same slot (175 mm y-axis baseline)
+  #               Strong left/right cue, but CANNOT distinguish front
+  #               from back because their purely inter-aural baseline
+  #               makes sin(θ) symmetric about 90°/270°.
+  #   diagonal  – cross-ear, different slot (~175 mm baseline at ~86°)
+  #               Mixed evidence: strong left/right plus a small
+  #               front/back component from the 12 mm x-offset.
+  #
+  # Design rationale – why we weight instead of dropping pairs:
+  #   Hard-dropping the lateral pairs would discard valid left/right
+  #   information.  Instead we keep all 6 pairs but down-weight the
+  #   laterals so their front/back ghosts are suppressed while their
+  #   side-discrimination power is retained.  On-ear pairs receive the
+  #   highest weight because they are the ONLY pairs whose baseline
+  #   lies along the front/back axis.
+  use_pair_groups:
+    on_ear: true                  # LF-LR, RF-RR
+    lateral: true                 # LF-RF, LR-RR
+    diagonal: true                # LF-RR, LR-RF
+
+  pair_weights:
+    LF_LR: 1.0                   # on-ear  (left)
+    RF_RR: 1.0                   # on-ear  (right)
+    LF_RF: 0.3                   # lateral (front)
+    LR_RR: 0.3                   # lateral (rear)
+    LF_RR: 0.8                   # diagonal
+    LR_RF: 0.8                   # diagonal
+
+  # Weighting mode controls how pair weights are applied:
+  #   "pair_group_weighted" – fixed weights from pair_weights above
+  weighting_mode: "pair_group_weighted"
+
+  # Peak detection in step 03
+  top_k_peaks_per_frame: 2       # how many DoA peaks to extract per frame
+  min_peak_distance_deg: 40      # minimum separation between global peaks
+  peak_rel_threshold: 0.15       # peaks must exceed this fraction of max
+
+  # Tracking / clustering (DBSCAN)
+  dbscan_eps_deg: 15.0           # angular neighbourhood (degrees)
+  dbscan_min_samples: 30         # minimum points to form a cluster
+  smooth_track_sigma: 5          # Gaussian smoothing of per-cluster tracks (frames)
+
+  # Calibration
+  calibration_n_clusters: 4      # number of speaker directions to learn
+  calibration_source: "example"  # tag of the WAV used for calibration
+
+# ── Enhancement ────────────────────────────────────────────────────────
 enhancement:
-  use_wpe: false              # set true once WPE is implemented
+  use_wpe: false
   wpe_taps: 10
   wpe_delay: 3
   mvdr_diagonal_loading: 1.0e-6
-  postfilter: "none"          # Options: none, wiener, binary_mask
+  postfilter: "none"              # Options: none, wiener, binary_mask
 
+# ── Analysis ───────────────────────────────────────────────────────────
 analysis:
-  vad_mode: 3                 # webrtcvad aggressiveness (0-3)
-  whisper_model: "large-v3"   # faster-whisper model size
+  vad_mode: 3
+  whisper_model: "large-v3"
   language_id_model: "speechbrain/lang-id-voxlingua107-ecapa"
   min_speech_duration_s: 0.3
 
+# ── Fusion ─────────────────────────────────────────────────────────────
 fusion:
   talker_of_interest_strategy: "highest_score"
   score_weights:
@@ -50,12 +112,13 @@ fusion:
     language_match: 0.2
     snr_estimate: 0.2
 
+# ── Paths ──────────────────────────────────────────────────────────────
 paths:
-  # All paths are relative to the project root.
   data_dir: "data"
   output_dir: "outputs"
   models_dir: "models"
 
+# ── Logging ────────────────────────────────────────────────────────────
 logging:
-  level: "INFO"               # DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
   format: "%(asctime)s | %(name)-28s | %(levelname)-7s | %(message)s"
