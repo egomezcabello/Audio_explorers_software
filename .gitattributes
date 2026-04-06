@@ -1,0 +1,20 @@
+# Git LFS / large-file attributes
+# Track binary audio and model files with Git LFS if enabled.
+# Uncomment the lines below after running `git lfs install`.
+
+# *.wav filter=lfs diff=lfs merge=lfs -text
+# *.flac filter=lfs diff=lfs merge=lfs -text
+# *.pt filter=lfs diff=lfs merge=lfs -text
+# *.bin filter=lfs diff=lfs merge=lfs -text
+# *.ckpt filter=lfs diff=lfs merge=lfs -text
+# *.npy filter=lfs diff=lfs merge=lfs -text
+# *.npz filter=lfs diff=lfs merge=lfs -text
+
+# Force consistent line endings for text files
+*.py text eol=lf
+*.sh text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.toml text eol=lf

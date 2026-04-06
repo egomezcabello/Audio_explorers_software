@@ -1,0 +1,87 @@
+.
+├── config.yaml
+├── CONTRIBUTING.md
+├── data
+│   └── README.md
+├── docs
+│   └── README.md
+├── LICENSE
+├── Makefile
+├── models
+│   ├── cache
+│   ├── optional_separation
+│   ├── README.md
+│   ├── speechbrain
+│   └── whisper
+├── outputs
+│   ├── analysis
+│   ├── calib
+│   ├── doa
+│   ├── final
+│   ├── intermediate
+│   ├── report
+│   │   ├── draft
+│   │   ├── figures
+│   │   └── tables
+│   └── separated
+├── pyproject.toml
+├── README.md
+├── repo_structure.txt
+├── requirements-dev.txt
+├── scripts
+│   ├── run_all.sh
+│   ├── run_member1.sh
+│   ├── run_member2.sh
+│   ├── run_member3.sh
+│   ├── run_member4.sh
+│   └── setup_env.sh
+├── src
+│   ├── common
+│   │   ├── audio_utils.py
+│   │   ├── config.py
+│   │   ├── constants.py
+│   │   ├── __init__.py
+│   │   ├── io_utils.py
+│   │   ├── json_schema.py
+│   │   ├── logging_utils.py
+│   │   ├── paths.py
+│   │   ├── plotting.py
+│   │   └── stft_utils.py
+│   ├── __init__.py
+│   ├── member1_doa
+│   │   ├── 00_load_and_stft.py
+│   │   ├── 01_calibrate_templates.py
+│   │   ├── 02_doa_estimate.py
+│   │   ├── 03_track_and_cluster.py
+│   │   ├── __init__.py
+│   │   └── run_all.py
+│   ├── member2_enhance
+│   │   ├── 00_wpe_optional.py
+│   │   ├── 01_build_masks_from_tracks.py
+│   │   ├── 02_mvdr_beamform.py
+│   │   ├── 03_postfilter_and_export.py
+│   │   ├── __init__.py
+│   │   └── run_all.py
+│   ├── member3_analysis
+│   │   ├── 00_vad_and_turns.py
+│   │   ├── 01_language_id.py
+│   │   ├── 02_asr_whisper.py
+│   │   ├── 03_pitch_voice_type.py
+│   │   ├── 04_pack_results.py
+│   │   ├── __init__.py
+│   │   └── run_all.py
+│   └── member4_fusion
+│       ├── 00_project_structure_and_config.py
+│       ├── 01_merge_candidates.py
+│       ├── 02_score_talker_of_interest.py
+│       ├── 03_make_figures.py
+│       ├── 04_run_end_to_end.py
+│       ├── __init__.py
+│       └── run_all.py
+└── tests
+    ├── test_config.py
+    ├── test_imports.py
+    ├── test_json_schema.py
+    └── test_paths.py
+
+26 directories, 58 files

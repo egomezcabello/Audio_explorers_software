@@ -1,0 +1,61 @@
+# ============================================================================
+# Audio Explorers – Scene Analysis Pipeline Configuration
+# ============================================================================
+# This file stores all shared parameters. Every member script should load
+# this config via src/common/config.py so that values are consistent.
+# ============================================================================
+
+project:
+  name: "Audio Explorers – Hearing-Aid Microphone Array Scene Analysis"
+  version: "0.1.0"
+
+audio:
+  sample_rate: 44100          # Hz – fixed for all recordings
+  n_channels: 4
+  channel_order:              # physical mic positions on hearing-aid pair
+    - "LF"                    # Left-Front
+    - "LR"                    # Left-Rear
+    - "RF"                    # Right-Front
+    - "RR"                    # Right-Rear
+
+stft:
+  n_fft: 1024
+  hop_length: 256
+  win_length: 1024
+  window: "hann"
+
+doa:
+  method: "gcc_phat"          # Options: gcc_phat, srp_phat, music
+  n_grid: 360                 # azimuth grid resolution (degrees)
+  freq_range: [300, 8000]     # Hz – band used for DoA estimation
+
+enhancement:
+  use_wpe: false              # set true once WPE is implemented
+  wpe_taps: 10
+  wpe_delay: 3
+  mvdr_diagonal_loading: 1.0e-6
+  postfilter: "none"          # Options: none, wiener, binary_mask
+
+analysis:
+  vad_mode: 3                 # webrtcvad aggressiveness (0-3)
+  whisper_model: "large-v3"   # faster-whisper model size
+  language_id_model: "speechbrain/lang-id-voxlingua107-ecapa"
+  min_speech_duration_s: 0.3
+
+fusion:
+  talker_of_interest_strategy: "highest_score"
+  score_weights:
+    doa_stability: 0.3
+    speech_duration: 0.3
+    language_match: 0.2
+    snr_estimate: 0.2
+
+paths:
+  # All paths are relative to the project root.
+  data_dir: "data"
+  output_dir: "outputs"
+  models_dir: "models"
+
+logging:
+  level: "INFO"               # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s | %(name)-28s | %(levelname)-7s | %(message)s"

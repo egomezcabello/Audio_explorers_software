@@ -1,0 +1,66 @@
+# ── Python ───────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# ── Virtual environments ────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── IDE / Editor ────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Audio & large binary data (DO NOT commit) ───────────────────────────
+data/*.wav
+data/*.flac
+data/*.mp3
+
+# ── Model weights (DO NOT commit) ───────────────────────────────────────
+models/whisper/*.bin
+models/whisper/*.pt
+models/speechbrain/*.ckpt
+models/speechbrain/*.pt
+models/optional_separation/*.pt
+models/cache/*
+!models/cache/.gitkeep
+
+# ── Generated outputs (DO NOT commit) ───────────────────────────────────
+outputs/calib/*.json
+outputs/doa/*.npy
+outputs/doa/*.json
+outputs/intermediate/*.npy
+outputs/separated/*.wav
+outputs/separated/*.npz
+outputs/analysis/*.json
+outputs/analysis/*.txt
+outputs/final/*.wav
+outputs/final/*.json
+outputs/final/figures/*.png
+outputs/report/figures/*.png
+outputs/report/tables/*.csv
+outputs/report/draft/*.pdf
+outputs/report/draft/*.tex
+
+# ── Environment files with secrets ──────────────────────────────────────
+.env
+
+# ── Jupyter notebooks checkpoints ───────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── pytest / coverage ───────────────────────────────────────────────────
+.pytest_cache/
+htmlcov/
+.coverage

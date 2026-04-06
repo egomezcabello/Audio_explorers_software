@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "audio-explorers"
+version = "0.1.0"
+description = "4-channel hearing-aid microphone array scene analysis pipeline"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Audio Explorers Team"},
+]
+
+# ── Runtime dependencies ────────────────────────────────────────────────
+# These are the libraries the pipeline relies on at run time.
+# Install with:  pip install -e .
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "soundfile>=0.12",
+    "matplotlib>=3.7",
+    "scikit-learn>=1.2",
+    "librosa>=0.10",
+    "pandas>=2.0",
+    "pyyaml>=6.0",
+    "webrtcvad>=2.0.10",
+    "faster-whisper>=0.10",
+    "speechbrain>=0.5",
+    "nara-wpe>=0.0.9",
+    "pyroomacoustics>=0.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "black",
+    "ruff",
+    "isort",
+    "pre-commit",
+]
+
+# ── Entry points (optional CLI shortcuts) ───────────────────────────────
+[project.scripts]
+ae-member1 = "src.member1_doa.run_all:main"
+ae-member2 = "src.member2_enhance.run_all:main"
+ae-member3 = "src.member3_analysis.run_all:main"
+ae-member4 = "src.member4_fusion.run_all:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+# ── Tool configuration ──────────────────────────────────────────────────
+[tool.black]
+line-length = 99
+
+[tool.ruff]
+line-length = 99
+select = ["E", "F", "W", "I"]
+
+[tool.isort]
+profile = "black"
+line_length = 99
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
