@@ -68,12 +68,17 @@ def main() -> None:
 
     # ── Determine tags to process for DoA / tracking ───────────────────
     if args.tags:
-        tags = args.tags
+        tags = list(args.tags)
     else:
         from src.common.paths import INTERMEDIATE_DIR
         stft_files = sorted(INTERMEDIATE_DIR.glob("*_stft.npy"))
         tags = [f.stem.replace("_stft", "") for f in stft_files]
         logger.info("Auto-detected input tags: %s", tags)
+
+    # Always include the calibration tag (example) so that example
+    # validation results are printed even when running only --tags mixture.
+    if calib_tag not in tags:
+        tags = [calib_tag] + tags
 
     # ── Steps 02–03 for each tag ──────────────────────────────────────
     for tag in tags:

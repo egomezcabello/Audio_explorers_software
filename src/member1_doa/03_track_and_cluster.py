@@ -1,53 +1,56 @@
 #!/usr/bin/env python3
 """
-03_track_and_cluster.py – Per-frame peak extraction and DBSCAN tracking.
-=========================================================================
+03_track_and_cluster.py – Global-direction tracking with quality filtering.
+============================================================================
 Fourth (final) step of the Member 1 (DoA) pipeline.
 
 What it does
 ------------
 Takes the angular power map P(θ, t) from step 02 and extracts discrete
-speaker candidates with start/end times and a smoothed DoA track.
+speaker candidates with smoothed DoA tracks and active-segment times.
 
 Algorithm
 ---------
-1.  **Per-frame peak finding**: in each time frame, pick the top-K peaks
-    (default K=2) with at least ``min_peak_distance_deg`` separation.
-    This yields a set of (frame_idx, azimuth_deg, score) points.
+1.  **Find global dominant directions** from the *time-averaged* angular
+    power spectrum.  These are stable, well-separated peaks that
+    represent the most likely speaker positions over the whole file.
+    Using global directions first prevents the over-fragmentation that
+    density-based methods (e.g. DBSCAN) cause when speakers are
+    intermittent.
 
-2.  **DBSCAN clustering** in (time, angle) space.  Because the angle axis
-    wraps at 360°, we embed each point as (time, cos θ, sin θ) and use
-    Euclidean distance with appropriately scaled axes.
+2.  **Selective per-frame peak extraction**: in each time frame, pick
+    the top-K peaks (default K=3) with at least ``min_peak_distance_deg``
+    separation.  A *second-peak gate* rejects secondary peaks whose
+    height is below ``second_peak_ratio × strongest_peak``.  This
+    suppresses ghost lobes from front/back ambiguity.
 
-    ⚠ Memory note: the previous DBSCAN attempt on raw (N×N) distance
-    matrices caused OOM (~27 k × 27 k × 8 B ≈ 5.7 GB).  We avoid
-    this by either:
-      a. Sub-sampling if points > threshold, or
-      b. Using sklearn's ball-tree–based DBSCAN which avoids the full
-         matrix when ``metric='euclidean'``.
+3.  **Assign peaks to global directions**: each extracted peak is
+    assigned to its nearest global direction if the angular distance
+    is ≤ ``max_assign_dist_deg``.  Farther points become noise.
 
-3.  **Track smoothing**: for each cluster, compute the per-frame median
-    azimuth, then Gaussian-smooth with σ = ``smooth_track_sigma`` frames.
+4.  **Track smoothing**: for each direction, compute per-frame circular
+    mean azimuth, unwrap, interpolate gaps, and Gaussian-smooth.
 
-4.  **Active-segment extraction**: find contiguous blocks where the
-    cluster is active and record start_sec / end_sec.
+5.  **Quality filtering**: tracks are removed if they have:
+    - too few assigned points  (< ``min_track_points_frac × n_frames``)
+    - too short total active duration  (< ``min_track_duration_s``)
+    - too low mean score relative to the strongest track
+      (< ``min_track_score_ratio × best_track_mean_score``)
 
-5.  **Summary**: JSON list of candidates, each with id, mean azimuth,
-    active segments, and the smoothed track.
+6.  **Example validation** (tag == "example" only): compare final track
+    angles against the known 0°/90°/180°/270° positions and log errors.
 
 STFT convention: X[ch, f, t]  (same as earlier steps).
 
 Outputs
 -------
-- ``outputs/doa/{tag}_doa_tracks.json``  — per-tag tracks
-- ``outputs/doa/doa_tracks.json``        — canonical (for mixture)
+- ``outputs/doa/{tag}_doa_tracks.json``  -- per-tag tracks
+- ``outputs/doa/doa_tracks.json``        -- canonical (for mixture)
 """
 
 from __future__ import annotations
 
 import json
-import logging
-from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -62,28 +65,115 @@ from src.common.paths import DOA_DIR, ensure_output_dirs
 logger = setup_logging(__name__)
 
 
-# ── 1. Peak extraction ────────────────────────────────────────────────
+# ── helpers ────────────────────────────────────────────────────────────
 
-def extract_peaks_per_frame(
+def _angular_distance(a: float, b: float) -> float:
+    """Shortest angular distance in degrees (0–180)."""
+    d = abs(a - b) % 360
+    return d if d <= 180 else 360 - d
+
+
+def _circular_mean(angles_deg: np.ndarray) -> float:
+    """Circular mean of angles in degrees → value in [0, 360)."""
+    rad = np.deg2rad(angles_deg)
+    return float(np.degrees(np.arctan2(
+        np.mean(np.sin(rad)), np.mean(np.cos(rad))))) % 360.0
+
+
+# ── 1. Global dominant directions ─────────────────────────────────────
+
+def find_global_directions(
     P: np.ndarray,
-    top_k: int = 2,
     min_distance_deg: int = 40,
-    rel_threshold: float = 0.15,
-) -> np.ndarray:
+    rel_threshold: float = 0.10,
+    prominence_frac: float = 0.10,
+    max_speakers: int = 8,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Extract the top-K peaks from each frame of the angular power map.
+    Find dominant speaker directions from the time-averaged angular
+    power spectrum.
 
     Parameters
     ----------
     P : np.ndarray, shape (n_grid, n_frames)
-        Normalised angular power (values in [0, 1]).
-    top_k : int
-        Number of peaks to extract per frame.
     min_distance_deg : int
-        Minimum angular distance between peaks (in grid bins, which
-        equals degrees when n_grid == 360).
+        Minimum angular separation between returned peaks.
     rel_threshold : float
-        Peaks must exceed this fraction of the frame's maximum.
+        Peaks must exceed this fraction of the global maximum.
+    prominence_frac : float
+        Peaks must have prominence ≥ this fraction of global max.
+    max_speakers : int
+        Hard cap on the number of directions returned.
+
+    Returns
+    -------
+    directions : np.ndarray  – peak angles in degrees (sorted)
+    heights    : np.ndarray  – corresponding peak heights
+    """
+    n_grid = P.shape[0]
+    avg = P.mean(axis=1)
+    avg_max = avg.max()
+    if avg_max < 1e-12:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+    height_thr = rel_threshold * avg_max
+    prom_thr = prominence_frac * avg_max
+
+    # Circular-safe peak detection: tile the spectrum
+    pad = min_distance_deg + 2
+    tiled = np.concatenate([avg[-pad:], avg, avg[:pad]])
+    peaks, props = find_peaks(
+        tiled,
+        height=height_thr,
+        distance=min_distance_deg,
+        prominence=prom_thr,
+    )
+    peaks_orig = peaks - pad
+    valid = (peaks_orig >= 0) & (peaks_orig < n_grid)
+    peaks_orig = peaks_orig[valid]
+    peak_heights = props["peak_heights"][valid]
+
+    if len(peaks_orig) == 0:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+    # Keep top-max_speakers by height
+    order = np.argsort(peak_heights)[::-1][:max_speakers]
+    dirs = peaks_orig[order].astype(np.float64)
+    hts = peak_heights[order]
+    # Sort by angle for deterministic ordering
+    sort_idx = np.argsort(dirs)
+    return dirs[sort_idx], hts[sort_idx]
+
+
+# ── 2. Selective per-frame peak extraction ────────────────────────────
+
+def extract_peaks_per_frame(
+    P: np.ndarray,
+    top_k: int = 3,
+    min_distance_deg: int = 40,
+    rel_threshold: float = 0.15,
+    second_peak_ratio: float = 0.50,
+) -> np.ndarray:
+    """
+    Extract per-frame peaks with a second-peak gate.
+
+    The strongest peak in each frame is always kept (if it exceeds
+    ``rel_threshold``).  Additional peaks are kept only if their height
+    is ≥ ``second_peak_ratio × strongest_peak_in_frame``.
+
+    Parameters
+    ----------
+    P : np.ndarray, shape (n_grid, n_frames)
+    top_k : int
+        Maximum peaks per frame.
+    min_distance_deg : int
+        Minimum angular separation between peaks.
+    rel_threshold : float
+        Absolute floor: peaks < ``rel_threshold × frame_max`` are dropped.
+    second_peak_ratio : float
+        Secondary peaks must reach this fraction of the frame's
+        strongest peak.  0.5 means the second peak must be at least
+        half as tall as the first.
 
     Returns
     -------
@@ -97,20 +187,16 @@ def extract_peaks_per_frame(
         spectrum = P[:, t]
         frame_max = spectrum.max()
         if frame_max < 1e-8:
-            continue  # silent frame
+            continue
 
         height_thr = rel_threshold * frame_max
 
-        # ── Circular peak detection ──────────────────────────────────
-        # Tile the spectrum to handle 0°/360° wrap-around.
-        # We prepend and append `pad` copies so peaks near 0° or 360°
-        # are detected correctly.
+        # Circular peak detection via tiling
         pad = min_distance_deg + 2
         tiled = np.concatenate([spectrum[-pad:], spectrum, spectrum[:pad]])
         peaks, props = find_peaks(
             tiled, height=height_thr, distance=min_distance_deg,
         )
-        # Map peak indices back to the original range
         peaks_orig = peaks - pad
         valid_mask = (peaks_orig >= 0) & (peaks_orig < n_grid)
         peaks_orig = peaks_orig[valid_mask]
@@ -119,79 +205,28 @@ def extract_peaks_per_frame(
         if len(peaks_orig) == 0:
             continue
 
-        # Keep top-K by height
+        # Sort by height (strongest first)
         order = np.argsort(heights)[::-1][:top_k]
-        for idx in order:
-            az = float(peaks_orig[idx])  # degree (0-indexed grid bin)
-            sc = float(heights[idx])
-            all_points.append((t, az, sc))
+        best_height = heights[order[0]]
+
+        for rank, idx in enumerate(order):
+            h = heights[idx]
+            # Always accept the strongest; gate the rest
+            if rank > 0 and h < second_peak_ratio * best_height:
+                continue
+            all_points.append((t, float(peaks_orig[idx]), float(h)))
 
     if not all_points:
         return np.empty((0, 3), dtype=np.float64)
     return np.array(all_points, dtype=np.float64)
 
 
-# ── 2. Global peak detection + per-frame assignment ───────────────────
+# ── 3. Assign peaks to global directions ──────────────────────────────
 
-def _angular_distance(a: float, b: float) -> float:
-    """Shortest angular distance in degrees (0–180)."""
-    d = abs(a - b) % 360
-    return d if d <= 180 else 360 - d
-
-
-def find_global_directions(
-    P: np.ndarray,
-    min_distance_deg: int = 40,
-    rel_threshold: float = 0.10,
-    max_speakers: int = 8,
-) -> np.ndarray:
-    """
-    Find dominant speaker directions from the **time-averaged** angular
-    power spectrum.
-
-    Parameters
-    ----------
-    P : np.ndarray, shape (n_grid, n_frames)
-    min_distance_deg : int
-    rel_threshold : float
-    max_speakers : int
-
-    Returns
-    -------
-    directions : np.ndarray, shape (K,)
-        Dominant azimuths in degrees (sorted).
-    """
-    n_grid = P.shape[0]
-    avg = P.mean(axis=1)  # (n_grid,)
-    avg_max = avg.max()
-    if avg_max < 1e-12:
-        return np.array([], dtype=np.float64)
-
-    height_thr = rel_threshold * avg_max
-
-    # Circular peak detection on the average spectrum
-    pad = min_distance_deg + 2
-    tiled = np.concatenate([avg[-pad:], avg, avg[:pad]])
-    peaks, props = find_peaks(tiled, height=height_thr,
-                              distance=min_distance_deg)
-    peaks_orig = peaks - pad
-    valid = (peaks_orig >= 0) & (peaks_orig < n_grid)
-    peaks_orig = peaks_orig[valid]
-    heights = props["peak_heights"][valid]
-
-    if len(peaks_orig) == 0:
-        return np.array([], dtype=np.float64)
-
-    # Keep top-K by height
-    order = np.argsort(heights)[::-1][:max_speakers]
-    dirs = np.sort(peaks_orig[order].astype(np.float64))
-    return dirs
-
-
-def assign_points_to_directions(
+def assign_peaks_to_directions(
     points: np.ndarray,
     directions: np.ndarray,
-    max_distance_deg: float = 20.0,
+    max_distance_deg: float = 25.0,
 ) -> np.ndarray:
     """
     Assign each per-frame peak to the nearest global direction.
@@ -199,16 +234,15 @@ def assign_points_to_directions(
     Parameters
     ----------
     points : np.ndarray, shape (N, 3)
-        ``(frame_idx, azimuth_deg, score)``
     directions : np.ndarray, shape (K,)
-        Global speaker directions in degrees.
+        Global direction angles in degrees.
     max_distance_deg : float
-        Points farther than this from any direction are labelled -1.
+        Points farther than this from every direction are labelled −1.
 
     Returns
     -------
     labels : np.ndarray, shape (N,)
-        Index into ``directions`` for each point, or -1 for noise.
+        Cluster index (0 … K-1) or −1 for noise.
     """
     N = points.shape[0]
     K = len(directions)
@@ -216,7 +250,7 @@ def assign_points_to_directions(
 
     for i in range(N):
         az = points[i, 1]
-        best_dist = max_distance_deg + 1
+        best_dist = max_distance_deg + 1.0
         best_k = -1
         for k in range(K):
             d = _angular_distance(az, directions[k])
@@ -229,26 +263,19 @@ def assign_points_to_directions(
     return labels
 
 
-# ── 3. Track extraction and smoothing ─────────────────────────────────
+# ── 4. Track building & smoothing ─────────────────────────────────────
 
-def _circular_mean(angles_deg: np.ndarray) -> float:
-    """Compute the circular mean of angles in degrees."""
-    rad = np.deg2rad(angles_deg)
-    mean_sin = np.mean(np.sin(rad))
-    mean_cos = np.mean(np.cos(rad))
-    mean_rad = np.arctan2(mean_sin, mean_cos)
-    return float(np.degrees(mean_rad)) % 360.0
-
-
-def extract_tracks(
+def build_tracks(
     points: np.ndarray,
     labels: np.ndarray,
     n_frames: int,
     hop_length: int,
     smooth_sigma: int = 5,
+    segment_merge_gap: int = 20,
+    min_segment_dur_s: float = 0.1,
 ) -> List[Dict[str, Any]]:
     """
-    Build one track per valid cluster: smoothed azimuth, active segments.
+    Build one smoothed track per direction.
 
     Parameters
     ----------
@@ -256,108 +283,89 @@ def extract_tracks(
         ``(frame_idx, azimuth_deg, score)``
     labels : np.ndarray, shape (N,)
     n_frames : int
-        Total number of STFT frames.
     hop_length : int
-        STFT hop in samples (for time conversion).
     smooth_sigma : int
-        Gaussian σ in frames for track smoothing.
+    segment_merge_gap : int
+        Merge active segments separated by fewer frames than this.
+    min_segment_dur_s : float
+        Drop segments shorter than this.
 
     Returns
     -------
-    tracks : list of dict
-        Each dict follows the shared ``Candidate`` schema:
-          - ``id``              : str like ``"spk00"``
-          - ``doa_track``        : [[frame_idx, azimuth_deg], ...]
-          - ``active_segments``  : [[start_s, end_s], ...]
-          - ``mean_azimuth``     : float (circular mean, degrees)
-          - ``azimuth_track``    : per-frame smoothed azimuth (or None)
-          - ``n_points``         : int (raw peak count)
+    tracks : list[dict]
     """
     sr = SAMPLE_RATE
     unique_labels = sorted(set(labels) - {-1})
     tracks: List[Dict[str, Any]] = []
 
-    for k_idx, k in enumerate(unique_labels):
+    for k in unique_labels:
         mask = labels == k
         pk = points[mask]
         frames = pk[:, 0].astype(int)
         azimuths = pk[:, 1]
         scores = pk[:, 2]
 
-        # Circular mean azimuth
         mean_az = _circular_mean(azimuths)
+        mean_score = float(scores.mean())
 
-        # Per-frame median azimuth (using circular median approximation)
-        # We compute the circular mean per frame, then smooth.
+        # Per-frame circular mean azimuth
         az_per_frame = np.full(n_frames, np.nan)
         for f in np.unique(frames):
-            frame_mask = frames == f
-            az_per_frame[f] = _circular_mean(azimuths[frame_mask])
+            fm = frames == f
+            az_per_frame[f] = _circular_mean(azimuths[fm])
 
-        # Smooth the track (fill gaps first with interpolation)
         valid = ~np.isnan(az_per_frame)
         if valid.sum() < 2:
             continue
 
-        # Unwrap for smoothing (avoid 0/360 jumps)
-        az_unwrapped = np.copy(az_per_frame)
-        valid_indices = np.where(valid)[0]
-        valid_vals = az_per_frame[valid_indices]
+        # Unwrap → interpolate → Gaussian smooth
+        vi = np.where(valid)[0]
+        vv = np.deg2rad(az_per_frame[vi])
+        unwrapped = np.unwrap(vv)
+        interp = np.interp(np.arange(n_frames), vi, unwrapped)
+        smoothed = np.degrees(gaussian_filter1d(interp, sigma=smooth_sigma)) % 360.0
 
-        # Linear interpolation to fill gaps
-        all_indices = np.arange(n_frames)
-        # Unwrap the valid values
-        rad_valid = np.deg2rad(valid_vals)
-        unwrapped_rad = np.unwrap(rad_valid)
-        # Interpolate
-        interp_rad = np.interp(all_indices, valid_indices, unwrapped_rad)
-        # Smooth
-        smoothed_rad = gaussian_filter1d(interp_rad, sigma=smooth_sigma)
-        smoothed_deg = np.degrees(smoothed_rad) % 360.0
-
-        # Mark only frames where the cluster was actually active
-        # (within the range of observed frames)
+        # Restrict to observed activity range
         f_min, f_max = int(frames.min()), int(frames.max())
         track_az = np.full(n_frames, np.nan)
-        track_az[f_min:f_max + 1] = smoothed_deg[f_min:f_max + 1]
+        track_az[f_min:f_max + 1] = smoothed[f_min:f_max + 1]
 
-        # Active segments: contiguous blocks of observed frames
-        # (merge gaps smaller than 20 frames)
+        # Build active segments (merge small gaps)
         active_frames = np.sort(np.unique(frames))
         segments: List[List[float]] = []
         if len(active_frames) > 0:
             seg_start = active_frames[0]
             prev = active_frames[0]
-            merge_gap = 20  # frames
             for fi in active_frames[1:]:
-                if fi - prev > merge_gap:
-                    # Close segment → [start_sec, end_sec]
-                    t_start = float(seg_start * hop_length / sr)
-                    t_end = float(prev * hop_length / sr)
-                    if t_end - t_start >= 0.1:
-                        segments.append([round(t_start, 3), round(t_end, 3)])
+                if fi - prev > segment_merge_gap:
+                    t0 = round(float(seg_start * hop_length / sr), 3)
+                    t1 = round(float(prev * hop_length / sr), 3)
+                    if t1 - t0 >= min_segment_dur_s:
+                        segments.append([t0, t1])
                     seg_start = fi
                 prev = fi
-            # Close last segment
-            t_start = float(seg_start * hop_length / sr)
-            t_end = float(prev * hop_length / sr)
-            if t_end - t_start >= 0.1:
-                segments.append([round(t_start, 3), round(t_end, 3)])
+            t0 = round(float(seg_start * hop_length / sr), 3)
+            t1 = round(float(prev * hop_length / sr), 3)
+            if t1 - t0 >= min_segment_dur_s:
+                segments.append([t0, t1])
 
         if not segments:
             continue
 
-        # Build doa_track: [[frame_idx, azimuth_deg], ...] for frames
-        # where the speaker was observed (matches Candidate schema).
-        doa_track: List[List[float]] = []
-        for f_idx in range(n_frames):
-            if not np.isnan(track_az[f_idx]):
-                doa_track.append([f_idx, round(float(track_az[f_idx]), 1)])
+        total_dur = sum(s[1] - s[0] for s in segments)
+
+        # doa_track: [[frame_idx, azimuth_deg], ...]
+        doa_track: List[List[float]] = [
+            [f_idx, round(float(track_az[f_idx]), 1)]
+            for f_idx in range(n_frames) if not np.isnan(track_az[f_idx])
+        ]
 
         tracks.append({
-            "id": f"spk{k_idx:02d}",
+            "id": "",                         # assigned after filtering
             "mean_azimuth": round(mean_az, 1),
+            "mean_score": round(mean_score, 4),
             "n_points": int(mask.sum()),
+            "total_duration_s": round(total_dur, 3),
             "doa_track": doa_track,
             "active_segments": segments,
             "azimuth_track": [
@@ -366,20 +374,118 @@ def extract_tracks(
             ],
         })
 
-    # Sort by mean azimuth for consistent ordering
-    tracks.sort(key=lambda t: t["mean_azimuth"])
-    # Re-number ids sequentially as "spk00", "spk01", …
-    for i, tr in enumerate(tracks):
+    return tracks
+
+
+# ── 5. Quality filtering ──────────────────────────────────────────────
+
+def filter_tracks(
+    tracks: List[Dict[str, Any]],
+    n_frames: int,
+    min_points_frac: float = 0.03,
+    min_duration_s: float = 0.5,
+    min_score_ratio: float = 0.15,
+) -> List[Dict[str, Any]]:
+    """
+    Remove weak / short / ghost tracks.
+
+    Criteria (a track is **removed** if *any* condition is true):
+      1. n_points  <  min_points_frac × n_frames
+      2. total active duration  <  min_duration_s
+      3. mean_score  <  min_score_ratio × best_track_mean_score
+
+    Parameters
+    ----------
+    tracks : list[dict]
+    n_frames : int
+    min_points_frac : float
+    min_duration_s : float
+    min_score_ratio : float
+
+    Returns
+    -------
+    filtered : list[dict]
+        Surviving tracks, re-numbered as spk00, spk01, …
+    """
+    if not tracks:
+        return []
+
+    min_points = max(2, int(min_points_frac * n_frames))
+    best_score = max(t["mean_score"] for t in tracks)
+    score_floor = min_score_ratio * best_score
+
+    kept: List[Dict[str, Any]] = []
+    for tr in tracks:
+        if tr["n_points"] < min_points:
+            logger.debug("  REJECT %s: too few points (%d < %d)",
+                         tr["mean_azimuth"], tr["n_points"], min_points)
+            continue
+        if tr["total_duration_s"] < min_duration_s:
+            logger.debug("  REJECT %s: too short (%.2fs < %.2fs)",
+                         tr["mean_azimuth"], tr["total_duration_s"],
+                         min_duration_s)
+            continue
+        if tr["mean_score"] < score_floor:
+            logger.debug("  REJECT %s: too weak (%.4f < %.4f)",
+                         tr["mean_azimuth"], tr["mean_score"], score_floor)
+            continue
+        kept.append(tr)
+
+    # Sort by mean azimuth and assign stable IDs
+    kept.sort(key=lambda t: t["mean_azimuth"])
+    for i, tr in enumerate(kept):
         tr["id"] = f"spk{i:02d}"
 
-    return tracks
+    return kept
+
+
+# ── 6. Example-aware validation ───────────────────────────────────────
+
+EXAMPLE_EXPECTED_DIRS = [0.0, 90.0, 180.0, 270.0]
+
+
+def _validate_example_tracks(tracks: List[Dict[str, Any]]) -> None:
+    """
+    Compare final tracks against the four known example directions and
+    log angular errors.  Purely informational — does not modify tracks.
+    """
+    detected = [t["mean_azimuth"] for t in tracks]
+
+    # Per-direction error logging at DEBUG level
+    for exp in EXAMPLE_EXPECTED_DIRS:
+        if not detected:
+            logger.debug("    %3.0f° expected -> NO MATCH", exp)
+            continue
+        dists = [_angular_distance(exp, d) for d in detected]
+        best_idx = int(np.argmin(dists))
+        logger.debug("    %3.0f° -> %5.1f°  (err=%.1f°)",
+                     exp, detected[best_idx], dists[best_idx])
+
+    # Compact summary at INFO
+    if len(detected) == len(EXAMPLE_EXPECTED_DIRS):
+        errors = []
+        used = set()
+        for exp in EXAMPLE_EXPECTED_DIRS:
+            dists = [(i, _angular_distance(exp, d))
+                     for i, d in enumerate(detected) if i not in used]
+            best_i, best_d = min(dists, key=lambda x: x[1])
+            errors.append(best_d)
+            used.add(best_i)
+        logger.info("[example][track] mean_err=%.1f° | detected=%s",
+                    np.mean(errors),
+                    [f"{d:.1f}" for d in detected])
+    else:
+        logger.warning("[example][track] count mismatch: got %d, "
+                       "expected %d | detected=%s",
+                       len(detected), len(EXAMPLE_EXPECTED_DIRS),
+                       [f"{d:.1f}" for d in detected])
 
 
 # ── Entry point ────────────────────────────────────────────────────────
 
 def main(tag: str = "mixture") -> None:
     """
-    Run tracking / clustering for the given tag.
+    Run direction tracking for the given tag.
 
     Parameters
     ----------
@@ -389,72 +495,114 @@ def main(tag: str = "mixture") -> None:
     ensure_output_dirs()
 
     doa_cfg = CFG.get("doa", {})
-    top_k = doa_cfg.get("top_k_peaks_per_frame", 2)
-    min_dist = doa_cfg.get("min_peak_distance_deg", 40)
-    rel_thr = doa_cfg.get("peak_rel_threshold", 0.15)
-    eps_deg = doa_cfg.get("dbscan_eps_deg", 15.0)
-    min_samples = doa_cfg.get("dbscan_min_samples", 30)
+
+    # ── Config parameters ─────────────────────────────────────────────
+    top_k        = doa_cfg.get("top_k_peaks_per_frame", 3)
+    min_dist     = doa_cfg.get("min_peak_distance_deg", 40)
+    rel_thr      = doa_cfg.get("peak_rel_threshold", 0.15)
+    second_ratio = doa_cfg.get("second_peak_ratio", 0.50)
+    assign_dist  = doa_cfg.get("max_assign_dist_deg", 25.0)
+    prominence   = doa_cfg.get("global_peak_prominence", 0.10)
     smooth_sigma = doa_cfg.get("smooth_track_sigma", 5)
+    min_pt_frac  = doa_cfg.get("min_track_points_frac", 0.03)
+    min_dur      = doa_cfg.get("min_track_duration_s", 0.5)
+    min_sc_ratio = doa_cfg.get("min_track_score_ratio", 0.15)
 
     stft_params = get_stft_params()
-    hop_length = stft_params.get("hop_length", 256)
+    hop_length  = stft_params.get("hop_length", 256)
 
-    # Load angular power map from step 02
+    # ── Load angular power map from step 02 ───────────────────────────
     post_path = DOA_DIR / f"{tag}_doa_posteriors.npy"
     if not post_path.exists():
         raise FileNotFoundError(
-            f"DoA posteriors not found: {post_path}  — run step 02 first."
+            f"DoA posteriors not found: {post_path}  -- run step 02 first."
         )
 
     P = np.load(str(post_path))
     n_grid, n_frames = P.shape
     logger.info("[%s] Loaded posteriors: %s", tag, P.shape)
 
-    # 1. Extract peaks
-    logger.info("[%s] Extracting top-%d peaks per frame (min_dist=%d°) …",
-                tag, top_k, min_dist)
-    points = extract_peaks_per_frame(P, top_k=top_k,
-                                     min_distance_deg=min_dist,
-                                     rel_threshold=rel_thr)
-    logger.info("[%s] Extracted %d peak points.", tag, points.shape[0])
+    # ── Step 1: find global dominant directions ───────────────────────
+    directions, dir_heights = find_global_directions(
+        P,
+        min_distance_deg=min_dist,
+        rel_threshold=rel_thr,
+        prominence_frac=prominence,
+    )
+    logger.debug("[%s] Global directions: %s  (heights: %s)",
+                tag,
+                [f"{d:.0f}°" for d in directions],
+                [f"{h:.2f}" for h in dir_heights])
 
-    if points.shape[0] == 0:
-        logger.warning("[%s] No peaks found – writing empty tracks.", tag)
+    # ── Step 2: selective per-frame peak extraction ───────────────────
+    logger.info("[%s] Extracting peaks (top_k=%d, gate=%.0f%%) ...",
+                tag, top_k, second_ratio * 100)
+    points = extract_peaks_per_frame(
+        P,
+        top_k=top_k,
+        min_distance_deg=min_dist,
+        rel_threshold=rel_thr,
+        second_peak_ratio=second_ratio,
+    )
+    logger.debug("[%s] Extracted %d peak points.", tag, points.shape[0])
+
+    if points.shape[0] == 0 or len(directions) == 0:
+        logger.warning("[%s] No peaks or no directions -- writing empty.", tag)
         tracks: List[Dict[str, Any]] = []
     else:
-        # 2. Find global speaker directions from time-averaged spectrum
-        logger.info("[%s] Finding global directions (min_dist=%d°) …",
-                    tag, min_dist)
-        directions = find_global_directions(
-            P, min_distance_deg=min_dist, rel_threshold=rel_thr,
-        )
-        logger.info("[%s] Global directions: %s",
-                    tag, [f"{d:.0f}°" for d in directions])
-
-        # 3. Assign per-frame peaks to nearest global direction
-        max_assign_dist = eps_deg  # reuse DBSCAN eps as assignment radius
-        labels = assign_points_to_directions(
-            points, directions, max_distance_deg=max_assign_dist,
+        # ── Step 3: assign peaks to global directions ─────────────────
+        labels = assign_peaks_to_directions(
+            points, directions, max_distance_deg=assign_dist,
         )
         n_assigned = int((labels >= 0).sum())
         n_noise = int((labels == -1).sum())
-        logger.info("[%s] Assigned %d points to %d directions, %d noise.",
-                    tag, n_assigned, len(directions), n_noise)
+        logger.debug("[%s] Assigned %d points to %d direction(s), "
+                     "%d noise.",
+                     tag, n_assigned, len(directions), n_noise)
 
-        # 4. Extract smoothed tracks
-        tracks = extract_tracks(points, labels, n_frames,
-                                hop_length=hop_length,
-                                smooth_sigma=smooth_sigma)
+        # ── Step 4: build tracks ──────────────────────────────────────
+        tracks = build_tracks(
+            points, labels, n_frames,
+            hop_length=hop_length,
+            smooth_sigma=smooth_sigma,
+        )
+        logger.debug("[%s] Built %d raw tracks.", tag, len(tracks))
 
-    logger.info("[%s] Extracted %d speaker tracks:", tag, len(tracks))
+        # ── Step 5: quality filtering ─────────────────────────────────
+        tracks = filter_tracks(
+            tracks, n_frames,
+            min_points_frac=min_pt_frac,
+            min_duration_s=min_dur,
+            min_score_ratio=min_sc_ratio,
+        )
+        logger.debug("[%s] After filtering: %d track(s).", tag, len(tracks))
+
+    # ── Compact summary line ────────────────────────────────────────────
+    if tracks:
+        az_list = [f"{t['mean_azimuth']:.1f}" for t in tracks]
+        dur_list = [f"{t['total_duration_s']:.1f}" for t in tracks]
+        sc_list = [f"{t['mean_score']:.2f}" for t in tracks]
+        logger.info("[%s][track] n=%d | az=[%s] | dur_s=[%s] | score=[%s]",
+                    tag, len(tracks),
+                    ",".join(az_list), ",".join(dur_list),
+                    ",".join(sc_list))
+    else:
+        logger.info("[%s][track] n=0 (no tracks survived filtering)", tag)
+
+    # ── Per-track detail (DEBUG) ───────────────────────────────────────
     for tr in tracks:
-        logger.info(
-            "  %s: %.1f° (%d points, %d segment(s))",
+        logger.debug(
+            "  %s: %.1f° (%d pts, %.1fs, score=%.4f, %d seg)",
             tr["id"], tr["mean_azimuth"], tr["n_points"],
+            tr["total_duration_s"], tr["mean_score"],
             len(tr["active_segments"]),
         )
 
-    # Prepare output dict
+    # ── Step 6: example validation ────────────────────────────────────
+    if tag == "example" and tracks:
+        _validate_example_tracks(tracks)
+
+    # ── Save output ───────────────────────────────────────────────────
     result = {
         "tag": tag,
         "n_frames": int(n_frames),
@@ -462,28 +610,28 @@ def main(tag: str = "mixture") -> None:
         "hop_length": hop_length,
         "sample_rate": SAMPLE_RATE,
         "n_peak_points": int(points.shape[0]),
-        "clustering_params": {
-            "method": "global_peak_assignment",
-            "assignment_radius_deg": eps_deg,
-            "min_peak_distance_deg": min_dist,
+        "tracking_params": {
+            "method": "global_direction_assignment",
+            "n_global_directions": len(directions),
+            "max_assign_dist_deg": assign_dist,
+            "second_peak_ratio": second_ratio,
+            "min_track_points_frac": min_pt_frac,
+            "min_track_duration_s": min_dur,
+            "min_track_score_ratio": min_sc_ratio,
         },
         "candidates": tracks,
     }
 
-    # Save per-tag
     tag_path = DOA_DIR / f"{tag}_doa_tracks.json"
     with open(tag_path, "w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=2)
-    logger.info("[%s] Saved → %s", tag, tag_path)
 
-    # Canonical copy for "mixture"
     if tag == "mixture":
         canonical_path = DOA_DIR / "doa_tracks.json"
         with open(canonical_path, "w", encoding="utf-8") as fh:
             json.dump(result, fh, indent=2)
-        logger.info("[%s] Saved canonical → %s", tag, canonical_path)
 
-    logger.info("Step 03 [%s] complete.", tag)
+    logger.info("[%s][track] saved -> %s", tag, tag_path)
 
 
 if __name__ == "__main__":
