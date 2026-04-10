@@ -75,18 +75,42 @@ doa:
   weighting_mode: "pair_group_weighted"
 
   # Peak detection in step 03
-  top_k_peaks_per_frame: 2       # how many DoA peaks to extract per frame
-  min_peak_distance_deg: 40      # minimum separation between global peaks
+  top_k_peaks_per_frame: 3       # max peaks per frame (before gating)
+  min_peak_distance_deg: 40      # minimum separation between peaks
   peak_rel_threshold: 0.15       # peaks must exceed this fraction of max
+  second_peak_ratio: 0.50        # 2nd+ peaks must be ≥ 50% of strongest
 
-  # Tracking / clustering (DBSCAN)
-  dbscan_eps_deg: 15.0           # angular neighbourhood (degrees)
-  dbscan_min_samples: 30         # minimum points to form a cluster
-  smooth_track_sigma: 5          # Gaussian smoothing of per-cluster tracks (frames)
+  # Global-direction tracking
+  # Step 03 uses time-averaged power to find stable speaker directions,
+  # then assigns per-frame peaks to these directions.  This avoids the
+  # over-fragmentation that DBSCAN produces on intermittent speakers.
+  global_peak_prominence: 0.10   # prominence for global direction peaks
+  max_assign_dist_deg: 25.0      # max angular distance for assignment
+  smooth_track_sigma: 5          # Gaussian smoothing of tracks (frames)
+
+  # Track quality filtering
+  min_track_points_frac: 0.03    # min points as fraction of n_frames
+  min_track_duration_s: 0.5      # min total active duration (seconds)
+  min_track_score_ratio: 0.15    # min mean_score / best_track_mean_score
 
   # Calibration
   calibration_n_clusters: 4      # number of speaker directions to learn
   calibration_source: "example"  # tag of the WAV used for calibration
+  calibration_energy_quantile: 0.30        # reject bottom 30% frames by energy
+  calibration_confidence_quantile: 0.50    # among energy-passing, keep top 50% by confidence
+  calibration_max_frames: null             # optional hard cap (null = no cap)
+
+  # Balanced refinement — after initial clustering, cap each direction
+  # at target_frames_per_direction best frames so no direction dominates.
+  calibration_balanced_refinement: true
+  calibration_target_frames_per_direction: 150
+  calibration_min_frames_per_direction: 40
+
+  # Hybrid DoA scoring — combine SRP-PHAT with delay-domain template match
+  use_hybrid_doa_score: true           # enable hybrid SRP + template scoring
+  template_score_weight: 0.30          # blend: 0.70*SRP + 0.30*template
+  delay_mismatch_sigma_us: 25.0        # Gaussian kernel width in µs (25 is forgiving
+                                       # enough for overlapping speech; 15 was too strict)
 
 # ── Enhancement ────────────────────────────────────────────────────────
 enhancement:

@@ -155,8 +155,7 @@ def main(skip_example: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    import argparse as _ap
-    _p = _ap.ArgumentParser(description="Step 00 – Load WAVs & compute STFTs")
+    _p = argparse.ArgumentParser(description="Step 00 – Load WAVs & compute STFTs")
     _p.add_argument("--skip-example", action="store_true",
                     help="Skip processing of example_mixture.wav")
     _args = _p.parse_args()
