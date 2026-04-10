@@ -93,6 +93,20 @@ doa:
   min_track_duration_s: 0.5      # min total active duration (seconds)
   min_track_score_ratio: 0.15    # min mean_score / best_track_mean_score
 
+  # Windowed discovery – catches intermittent speakers the global average misses
+  use_windowed_discovery: true
+  window_duration_s: 1.5         # window length in seconds
+  window_overlap_frac: 0.5       # overlap between adjacent windows
+  windowed_peak_min_count: 3     # direction must appear in ≥ N windows
+
+  # Track splitting – splits bimodal clusters before track building
+  split_broad_tracks: true
+  track_split_std_deg: 18.0      # circular std threshold to trigger split
+  track_split_min_points: 30     # both subtracks must have ≥ N points
+
+  # Diffuseness rejection – removes garbage tracks with excessive spread
+  reject_diffuse_std_deg: 30.0   # reject tracks with angular std > this
+
   # Calibration
   calibration_n_clusters: 4      # number of speaker directions to learn
   calibration_source: "example"  # tag of the WAV used for calibration
@@ -118,7 +132,24 @@ enhancement:
   wpe_taps: 10
   wpe_delay: 3
   mvdr_diagonal_loading: 1.0e-6
-  postfilter: "none"              # Options: none, wiener, binary_mask
+  mask_sigma_deg: 6.0
+  mask_time_smooth_sigma: 0.3
+  mask_floor: 0.0
+  use_spatial_masks: true
+  mask_exponent: 3.0
+  spatial_pilot_threshold: 0.90
+  use_interferer_nulling: true
+  steering_mode: "doa_model"        # "doa_model" or "eigen"
+
+  # Subband masking – per-frequency masks via narrowband SRP alignment
+  use_subband_masks: true
+  subband_smooth_bins: 8           # smooth alignment across this many freq bins
+
+  # Segment-wise steering – per-block azimuth adapts to direction changes
+  segment_steering: true
+  steering_block_frames: 200       # block size in STFT frames (~1.2 s)
+
+  postfilter: "wiener"                # Options: none, wiener, binary_mask
 
 # ── Analysis ───────────────────────────────────────────────────────────
 analysis:

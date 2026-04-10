@@ -1,34 +1,67 @@
 #!/usr/bin/env python3
 """
 03_postfilter_and_export.py – Post-filter enhanced STFTs and export WAVs.
+==========================================================================
+Fourth (final) step of the Member 2 (Enhancement) pipeline.
 
-Applies optional post-filtering (Wiener, binary mask, …) to the MVDR
-output, then converts back to time domain and saves per-candidate WAV
-files to ``outputs/separated/``.
+Applies optional post-filtering to each candidate's beamformed STFT,
+then converts back to time domain and exports per-candidate WAV files.
 
-TODO:
-    - Implement Wiener or binary post-filter.
-    - Convert STFT back to waveform via iSTFT.
-    - Normalise and save each candidate as WAV.
-    - Optionally save debug NPZ with intermediate arrays.
+Post-filter methods
+-------------------
+- ``"none"``:  no filtering — pass through unchanged.
+- ``"wiener"``:  conservative Wiener-style gain using a smoothed power
+  envelope and a noise-floor estimate from the quietest frames of the
+  enhanced signal itself.
+- ``"binary_mask"``:  a gentle binary mask derived from the same Wiener
+  gain estimate — keeps bins above a threshold, attenuates the rest.
+
+STFT convention: ``(n_freq, n_frames)`` for the enhanced mono STFT.
+
+Outputs
+-------
+- ``outputs/separated/spkXX_enhanced.wav``
+- ``outputs/separated/spkXX_debug.npz``  (updated with final waveform)
 """
 
 from __future__ import annotations
 
-import logging
-from pathlib import Path
+import json
 
 import numpy as np
+from scipy.ndimage import uniform_filter
 
 from src.common.config import CFG
 from src.common.constants import SAMPLE_RATE
 from src.common.io_utils import save_mono_wav
-from src.common.json_schema import load_json
 from src.common.logging_utils import setup_logging
 from src.common.paths import DOA_DIR, SEPARATED_DIR, ensure_output_dirs
 from src.common.stft_utils import compute_istft
 
 logger = setup_logging(__name__)
+
+
+# ── Post-filter implementations ───────────────────────────────────────
+
+def _estimate_noise_floor(power: np.ndarray, quantile: float = 0.10) -> np.ndarray:
+    """
+    Estimate a per-frequency noise floor from the quietest frames.
+
+    Parameters
+    ----------
+    power : np.ndarray, shape (n_freq, n_frames)
+    quantile : float
+        Fraction of quietest frames used to estimate noise.
+
+    Returns
+    -------
+    noise_floor : np.ndarray, shape (n_freq, 1)
+    """
+    n_frames = power.shape[1]
+    k = max(1, int(quantile * n_frames))
+    sorted_power = np.sort(power, axis=1)
+    noise_floor = sorted_power[:, :k].mean(axis=1, keepdims=True)
+    return noise_floor
 
 
 def apply_postfilter(
@@ -40,28 +73,46 @@ def apply_postfilter(
 
     Parameters
     ----------
-    enhanced_stft : np.ndarray
-        Shape ``(n_freq, n_frames)`` – complex.
+    enhanced_stft : np.ndarray, shape (n_freq, n_frames) — complex
     method : str
-        ``"none"`` | ``"wiener"`` | ``"binary_mask"``.
+        ``"none"`` | ``"wiener"`` | ``"binary_mask"``
 
     Returns
     -------
     np.ndarray
         Post-filtered STFT, same shape.
-
-    TODO
-    ----
-    - Implement Wiener post-filter.
-    - Implement binary mask post-filter.
     """
     if method == "none":
         return enhanced_stft
 
-    # TODO: Implement post-filters
-    logger.warning("apply_postfilter('%s') is a placeholder – returning input.", method)
+    power = np.abs(enhanced_stft) ** 2
+    # Smooth power in time (window of 5 frames) for stability
+    smooth_power = uniform_filter(power, size=(1, 5), mode="reflect")
+    noise_floor = _estimate_noise_floor(power, quantile=0.10)
+
+    # Wiener-style gain: signal / (signal + noise)
+    gain = smooth_power / (smooth_power + noise_floor + 1e-12)
+    # Clip to be conservative — never boost, only attenuate
+    gain = np.clip(gain, 0.0, 1.0)
+
+    if method == "wiener":
+        # Mild square-root gain for gentler attenuation
+        gain = np.sqrt(gain)
+        return enhanced_stft * gain
+
+    if method == "binary_mask":
+        # Threshold the Wiener gain at 0.5 — but soften the transition
+        # to avoid harsh artefacts
+        threshold = 0.5
+        binary = np.where(gain >= threshold, 1.0, 0.1)
+        return enhanced_stft * binary
+
+    logger.warning("[member2][export] unknown postfilter '%s' — skipping.",
+                   method)
     return enhanced_stft
 
+
+# ── Entry point ────────────────────────────────────────────────────────
 
 def main() -> None:
     """Entry point for step 03 (post-filter & export)."""
@@ -70,23 +121,32 @@ def main() -> None:
     enh_cfg = CFG.get("enhancement", {})
     postfilter = enh_cfg.get("postfilter", "none")
 
-    # Load candidates list
+    # ── Load candidate list ────────────────────────────────────────────
     tracks_path = DOA_DIR / "doa_tracks.json"
-    if tracks_path.exists():
-        scene = load_json(tracks_path)
-        candidates = scene.get("candidates", [])
-    else:
-        candidates = []
+    if not tracks_path.exists():
+        raise FileNotFoundError(
+            f"[member2][export] DoA tracks not found: {tracks_path}"
+        )
+    with open(tracks_path, "r", encoding="utf-8") as fh:
+        scene = json.load(fh)
+    candidates = scene.get("candidates", [])
+    if not candidates:
+        logger.warning("[member2][export] no candidates — nothing to export.")
+        return
+    logger.info("[member2][export] %d candidate(s), postfilter='%s'",
+                len(candidates), postfilter)
 
+    # ── Per-candidate export ───────────────────────────────────────────
     for cand in candidates:
         cid = cand.get("id", "spk00")
         stft_path = SEPARATED_DIR / f"{cid}_enhanced_stft.npy"
 
-        if stft_path.exists():
-            enhanced_stft = np.load(str(stft_path))
-        else:
-            logger.warning("Enhanced STFT for %s not found – generating silence.", cid)
-            enhanced_stft = np.zeros((513, 100), dtype=np.complex64)
+        if not stft_path.exists():
+            logger.warning("[member2][export] %s enhanced STFT not found — "
+                           "skipping.", cid)
+            continue
+
+        enhanced_stft = np.load(str(stft_path))
 
         # Post-filter
         filtered = apply_postfilter(enhanced_stft, method=postfilter)
@@ -94,20 +154,32 @@ def main() -> None:
         # iSTFT → waveform
         _, audio = compute_istft(filtered)
 
+        # Gentle normalisation only if clipping would occur
+        peak = np.abs(audio).max()
+        if peak > 0.99:
+            audio = audio * (0.95 / peak)
+
         # Save WAV
         wav_path = SEPARATED_DIR / f"{cid}_enhanced.wav"
         save_mono_wav(wav_path, audio, sr=SAMPLE_RATE)
 
-        # Optionally save debug info
+        # Update debug file with final outputs
         debug_path = SEPARATED_DIR / f"{cid}_debug.npz"
-        np.savez_compressed(
-            str(debug_path),
-            enhanced_stft=filtered,
-            waveform=audio,
-        )
-        logger.info("Exported %s → %s + %s", cid, wav_path.name, debug_path.name)
+        debug_data = {}
+        if debug_path.exists():
+            with np.load(str(debug_path), allow_pickle=True) as d:
+                debug_data = dict(d)
+        debug_data["filtered_stft"] = filtered
+        debug_data["waveform"] = audio
+        debug_data["postfilter_method"] = np.array(postfilter)
+        np.savez_compressed(str(debug_path), **debug_data)
 
-    logger.info("Step 03 (export) complete.")
+        dur_s = len(audio) / SAMPLE_RATE
+        logger.info("[member2][export] %s: %.2fs  peak=%.3f  → %s",
+                    cid, dur_s, peak, wav_path.name)
+
+    logger.info("[member2][export] done — %d WAV(s) exported",
+                len(candidates))
 
 
 if __name__ == "__main__":

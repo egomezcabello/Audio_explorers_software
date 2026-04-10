@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
 """
 00_wpe_optional.py – Optional WPE dereverberation.
+====================================================
+First step of the Member 2 (Enhancement) pipeline.
 
 Applies Weighted Prediction Error (WPE) dereverberation to the
-multi-channel STFT if enabled in ``config.yaml``.
+multi-channel STFT if enabled in ``config.yaml``.  If ``nara_wpe`` is
+not installed or fails at runtime, falls back to an unmodified copy.
 
-Channel order (always):
-    ["LF", "LR", "RF", "RR"]
+STFT convention: ``(n_channels, n_freq, n_frames)`` — same as Member 1.
 
-TODO:
-    - Integrate ``nara_wpe`` for online or offline WPE.
-    - Save the dereverberated STFT to outputs/intermediate/.
-    - Add a bypass flag that simply copies the input if WPE is disabled.
+Outputs
+-------
+- ``outputs/intermediate/mixture_stft_wpe.npy``
 """
 
 from __future__ import annotations
-
-import logging
-from pathlib import Path
 
 import numpy as np
 
@@ -34,7 +32,7 @@ def apply_wpe(
     delay: int = 3,
 ) -> np.ndarray:
     """
-    Apply WPE dereverberation to a multi-channel STFT.
+    Apply offline WPE dereverberation using ``nara_wpe``.
 
     Parameters
     ----------
@@ -49,15 +47,25 @@ def apply_wpe(
     -------
     np.ndarray
         Dereverberated STFT, same shape as input.
-
-    TODO
-    ----
-    - Implement using ``nara_wpe.wpe`` or ``nara_wpe.wpe_v8``.
-    - Handle edge cases (very short signals, single channel).
     """
-    # TODO: Implement WPE dereverberation
-    logger.warning("apply_wpe() is a placeholder – returning input unchanged.")
-    return stft.copy()
+    try:
+        from nara_wpe.wpe import wpe as nara_wpe_func
+    except ImportError:
+        logger.warning("[member2][wpe] nara_wpe not installed — skipping.")
+        return stft.copy()
+
+    try:
+        # nara_wpe expects shape (n_channels, n_freq, n_frames)
+        dereverberated = nara_wpe_func(
+            stft,
+            taps=taps,
+            delay=delay,
+            iterations=3,
+        )
+        return dereverberated
+    except Exception as exc:
+        logger.warning("[member2][wpe] nara_wpe failed (%s) — skipping.", exc)
+        return stft.copy()
 
 
 def main() -> None:
@@ -68,27 +76,28 @@ def main() -> None:
     use_wpe = enh_cfg.get("use_wpe", False)
 
     stft_path = INTERMEDIATE_DIR / "mixture_stft.npy"
+    if not stft_path.exists():
+        raise FileNotFoundError(
+            f"[member2][wpe] STFT not found: {stft_path} — run Member 1 first."
+        )
 
-    if stft_path.exists():
-        stft = np.load(str(stft_path))
-        logger.info("Loaded STFT: %s", stft.shape)
-    else:
-        logger.warning("STFT not found at %s – creating dummy.", stft_path)
-        stft = np.zeros((4, 513, 100), dtype=np.complex64)
+    stft = np.load(str(stft_path))
+    logger.info("[member2][wpe] loaded STFT %s from %s", stft.shape, stft_path.name)
 
     if use_wpe:
         taps = enh_cfg.get("wpe_taps", 10)
         delay = enh_cfg.get("wpe_delay", 3)
-        stft = apply_wpe(stft, taps=taps, delay=delay)
-        logger.info("WPE applied (taps=%d, delay=%d).", taps, delay)
+        stft_out = apply_wpe(stft, taps=taps, delay=delay)
+        changed = not np.array_equal(stft, stft_out)
+        logger.info("[member2][wpe] WPE %s (taps=%d, delay=%d)",
+                    "applied" if changed else "no-op (fallback)", taps, delay)
     else:
-        logger.info("WPE disabled in config – skipping.")
+        stft_out = stft.copy()
+        logger.info("[member2][wpe] disabled in config — pass-through copy")
 
-    # Save (possibly dereverberated) STFT for next steps
     out_path = INTERMEDIATE_DIR / "mixture_stft_wpe.npy"
-    np.save(str(out_path), stft)
-    logger.info("Saved → %s", out_path)
-    logger.info("Step 00 (WPE) complete.")
+    np.save(str(out_path), stft_out)
+    logger.info("[member2][wpe] saved → %s  shape=%s", out_path.name, stft_out.shape)
 
 
 if __name__ == "__main__":

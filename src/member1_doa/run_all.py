@@ -80,7 +80,7 @@ def main() -> None:
     if calib_tag not in tags:
         tags = [calib_tag] + tags
 
-    # ── Steps 02–03 for each tag ──────────────────────────────────────
+    # ── Steps 02–04 for each tag ─────────────────────────────────────
     for tag in tags:
         logger.info("═" * 60)
         logger.info("Processing tag: %s", tag)
@@ -89,6 +89,8 @@ def main() -> None:
                   tag=tag)
         _run_step("03  Track & cluster", "src.member1_doa.03_track_and_cluster",
                   tag=tag)
+        _run_step("04  Visualize results",
+                  "src.member1_doa.04_visualize_results", tag=tag)
 
     logger.info("=" * 60)
     logger.info("Member 1 pipeline complete  (%d input(s))", len(tags))

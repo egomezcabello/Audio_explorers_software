@@ -1,174 +1,446 @@
 #!/usr/bin/env python3
 """
 02_mvdr_beamform.py – MVDR beamforming per candidate.
+======================================================
+Third step of the Member 2 (Enhancement) pipeline.
 
-Applies a Minimum Variance Distortionless Response (MVDR) beamformer to
-extract each candidate talker from the multi-channel mixture.
+Supports two steering modes (``enhancement.steering_mode``):
 
-TODO:
-    - Estimate target and noise spatial covariance matrices from masks.
-    - Compute / load steering vectors.
-    - Implement MVDR weight computation.
-    - Apply beamformer in the STFT domain.
+- ``"doa_model"``: build steering vector from Member 1 calibration
+  delay model + candidate mean azimuth.  More direction-specific.
+- ``"eigen"``: extract steering vector from the principal eigenvector
+  of the target covariance matrix (original method).
+
+STFT convention: ``(n_channels, n_freq, n_frames)``.
+
+Outputs
+-------
+- ``outputs/separated/spkXX_enhanced_stft.npy``
+- ``outputs/separated/spkXX_debug.npz``
 """
 
 from __future__ import annotations
 
-import logging
-from pathlib import Path
-from typing import List
+import json
+from typing import List, Optional, Tuple
 
 import numpy as np
 
-from src.common.config import CFG
-from src.common.json_schema import load_json
+from src.common.config import CFG, get_channel_order, get_stft_params
+from src.common.constants import SAMPLE_RATE
 from src.common.logging_utils import setup_logging
-from src.common.paths import DOA_DIR, INTERMEDIATE_DIR, SEPARATED_DIR, ensure_output_dirs
+from src.common.paths import (
+    CALIB_DIR, DOA_DIR, INTERMEDIATE_DIR, SEPARATED_DIR, ensure_output_dirs,
+)
 
 logger = setup_logging(__name__)
 
 
+# ── Covariance estimation ─────────────────────────────────────────────
+
 def estimate_covariance(
     stft: np.ndarray,
     mask: np.ndarray,
+    eps: float = 1e-12,
 ) -> np.ndarray:
     """
-    Estimate a spatial covariance matrix from a masked multi-channel STFT.
+    Estimate a spatial covariance matrix from a masked STFT.
 
     Parameters
     ----------
-    stft : np.ndarray
-        Shape ``(n_channels, n_freq, n_frames)``.
-    mask : np.ndarray
-        Shape ``(n_freq, n_frames)`` – values in [0, 1].
+    stft : shape (n_ch, n_freq, n_frames)
+    mask : shape (n_freq, n_frames) — values in [0, 1]
 
     Returns
     -------
-    cov : np.ndarray
-        Shape ``(n_freq, n_channels, n_channels)`` – covariance per bin.
-
-    TODO
-    ----
-    - Implement proper covariance estimation with mask weighting.
-    - Add diagonal loading for numerical stability.
+    cov : shape (n_freq, n_ch, n_ch) — complex
     """
-    # TODO: Implement covariance estimation
-    logger.warning("estimate_covariance() is a placeholder.")
     n_ch, n_freq, n_frames = stft.shape
     cov = np.zeros((n_freq, n_ch, n_ch), dtype=np.complex128)
+
     for f in range(n_freq):
-        cov[f] = np.eye(n_ch, dtype=np.complex128)
+        x = stft[:, f, :]
+        m = mask[f, :]
+        x_weighted = x * m[np.newaxis, :]
+        cov[f] = (x_weighted @ x.conj().T) / (m.sum() + eps)
+
     return cov
 
 
-def compute_steering_vector(
+# ── Steering: eigenvector method (original) ───────────────────────────
+
+def compute_steering_eigen(
     cov_target: np.ndarray,
 ) -> np.ndarray:
     """
-    Extract the steering vector from the target covariance matrix
-    (principal eigenvector).
+    Extract steering vector as principal eigenvector of target covariance.
+    Phase-normalised so channel 0 has real positive phase.
 
-    Parameters
-    ----------
-    cov_target : np.ndarray
-        Shape ``(n_freq, n_channels, n_channels)``.
+    Returns shape (n_freq, n_ch).
+    """
+    n_freq, n_ch, _ = cov_target.shape
+    steer = np.zeros((n_freq, n_ch), dtype=np.complex128)
+
+    for f in range(n_freq):
+        eigvals, eigvecs = np.linalg.eigh(cov_target[f])
+        d = eigvecs[:, -1]
+        d = d * np.exp(-1j * np.angle(d[0]))
+        d = d / (np.linalg.norm(d) + 1e-12)
+        steer[f] = d
+
+    return steer
+
+
+# ── Steering: DoA delay-model method (new) ────────────────────────────
+
+def compute_steering_doa_model(
+    mean_azimuth_deg: float,
+    calibration: dict,
+    n_freq: int,
+    n_fft: int,
+    sr: int,
+    channel_order: List[str],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build steering vector from calibration delay model at given azimuth.
+
+    The delay model gives pairwise TDOA as:
+        tau_pair(theta) = a * cos(theta) + b * sin(theta)
+
+    We recover per-mic absolute delays via least squares (fixing LF = 0),
+    then build:
+        d[f, m] = exp(-j * 2*pi * freq[f] * t_m)
 
     Returns
     -------
-    steer : np.ndarray
-        Shape ``(n_freq, n_channels)``.
-
-    TODO
-    ----
-    - Implement eigenvector-based steering vector extraction.
+    steer : shape (n_freq, n_ch)
+    mic_delays : shape (n_ch,) — relative delays in seconds
     """
-    # TODO: Implement steering vector computation
-    logger.warning("compute_steering_vector() is a placeholder.")
-    n_freq, n_ch, _ = cov_target.shape
-    steer = np.ones((n_freq, n_ch), dtype=np.complex128) / np.sqrt(n_ch)
-    return steer
+    delay_model = calibration["delay_model"]
+    theta_rad = np.deg2rad(mean_azimuth_deg)
 
+    # Predict pairwise delays at this azimuth
+    pair_taus = {}
+    for pair_name, model in delay_model.items():
+        a, b = model["a"], model["b"]
+        pair_taus[pair_name] = a * np.cos(theta_rad) + b * np.sin(theta_rad)
+
+    # Solve for per-mic delays via least squares.
+    # Fix reference channel (index 0) to delay 0.
+    n_ch = len(channel_order)
+    ref_ch = channel_order[0]
+    non_ref = [ch for ch in channel_order if ch != ref_ch]
+    non_ref_idx = {ch: i for i, ch in enumerate(non_ref)}
+
+    rows = []
+    rhs = []
+    for pair_name, tau in pair_taus.items():
+        parts = pair_name.split("_")
+        if len(parts) != 2:
+            continue
+        ch_a, ch_b = parts
+        if ch_a not in channel_order or ch_b not in channel_order:
+            continue
+        # Equation: t_a - t_b = tau
+        row = np.zeros(len(non_ref))
+        if ch_a != ref_ch:
+            row[non_ref_idx[ch_a]] = 1.0
+        if ch_b != ref_ch:
+            row[non_ref_idx[ch_b]] = -1.0
+        rows.append(row)
+        rhs.append(tau)
+
+    A_mat = np.array(rows)
+    b_vec = np.array(rhs)
+    delays_non_ref, _, _, _ = np.linalg.lstsq(A_mat, b_vec, rcond=None)
+
+    # Build full delay vector
+    ch_idx = {ch: i for i, ch in enumerate(channel_order)}
+    mic_delays = np.zeros(n_ch)
+    for ch, delay in zip(non_ref, delays_non_ref):
+        mic_delays[ch_idx[ch]] = delay
+
+    # Steering vector: d[f, m] = exp(-j 2 pi f_hz t_m)
+    freq_hz = np.arange(n_freq) * sr / n_fft
+    steer = np.exp(
+        -1j * 2 * np.pi * freq_hz[:, np.newaxis] * mic_delays[np.newaxis, :]
+    )
+
+    # Phase-normalise to channel 0
+    steer = steer * np.exp(-1j * np.angle(steer[:, 0:1]))
+
+    # Unit-normalise per frequency
+    steer = steer / (np.linalg.norm(steer, axis=1, keepdims=True) + 1e-12)
+
+    return steer, mic_delays
+
+
+# ── MVDR beamforming ──────────────────────────────────────────────────
 
 def mvdr_beamform(
     stft: np.ndarray,
     steer: np.ndarray,
     cov_noise: np.ndarray,
     diagonal_loading: float = 1e-6,
-) -> np.ndarray:
+    eps: float = 1e-10,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Apply MVDR beamformer weights to extract a single-channel signal.
+    Apply MVDR beamformer.
 
-    Parameters
-    ----------
-    stft : np.ndarray
-        Shape ``(n_channels, n_freq, n_frames)``.
-    steer : np.ndarray
-        Shape ``(n_freq, n_channels)``.
-    cov_noise : np.ndarray
-        Shape ``(n_freq, n_channels, n_channels)``.
-    diagonal_loading : float
-        Small value added to diagonal of noise covariance.
+    w[f] = R_n^{-1} d / (d^H R_n^{-1} d + eps)
+    y[f,t] = w[f]^H x[:,f,t]
+
+    Returns (enhanced, weights).
+    """
+    n_ch, n_freq, n_frames = stft.shape
+    enhanced = np.zeros((n_freq, n_frames), dtype=np.complex128)
+    weights = np.zeros((n_freq, n_ch), dtype=np.complex128)
+    eye = np.eye(n_ch, dtype=np.complex128)
+
+    for f in range(n_freq):
+        Rn = cov_noise[f] + diagonal_loading * eye
+        d = steer[f]
+        try:
+            Rn_inv = np.linalg.inv(Rn)
+        except np.linalg.LinAlgError:
+            Rn_inv = np.linalg.pinv(Rn)
+
+        Rn_inv_d = Rn_inv @ d
+        denom = d.conj() @ Rn_inv_d + eps
+        w = Rn_inv_d / denom
+        weights[f] = w
+        enhanced[f, :] = w.conj() @ stft[:, f, :]
+
+    return enhanced, weights
+
+
+# ── Segment-wise steering helpers ─────────────────────────────────────
+
+def _get_block_azimuths(
+    candidate: dict,
+    n_frames: int,
+    block_size: int = 200,
+) -> List[Tuple[int, int, float]]:
+    """
+    Divide the file into blocks and compute per-block circular-mean
+    azimuth from the smoothed DoA track.
 
     Returns
     -------
-    enhanced : np.ndarray
-        Shape ``(n_freq, n_frames)`` – beamformed STFT.
-
-    TODO
-    ----
-    - Implement MVDR weight calculation: w = (Rnn^-1 d) / (d^H Rnn^-1 d).
-    - Apply weights across all frames.
+    blocks : list of (start_frame, end_frame, azimuth_deg)
     """
-    # TODO: Implement MVDR beamforming
-    logger.warning("mvdr_beamform() is a placeholder – returning first channel.")
-    return stft[0]  # temporary: just pass through channel 0
+    az_track = candidate.get("azimuth_track", [])
+    mean_az = float(candidate.get("mean_azimuth", 0.0))
 
+    if not az_track:
+        return [(0, n_frames, mean_az)]
+
+    # Build full-length azimuth array (NaN where missing)
+    length = min(len(az_track), n_frames)
+    az_arr = np.full(n_frames, np.nan)
+    for i in range(length):
+        val = az_track[i]
+        if val is not None:
+            az_arr[i] = float(val)
+
+    blocks: List[Tuple[int, int, float]] = []
+    for start in range(0, n_frames, block_size):
+        end = min(start + block_size, n_frames)
+        chunk = az_arr[start:end]
+        valid = ~np.isnan(chunk)
+        if valid.sum() > 0:
+            rad = np.deg2rad(chunk[valid])
+            local_az = float(np.degrees(np.arctan2(
+                np.mean(np.sin(rad)), np.mean(np.cos(rad))))) % 360.0
+        else:
+            local_az = mean_az
+        blocks.append((start, end, local_az))
+
+    return blocks
+
+
+# ── Entry point ────────────────────────────────────────────────────────
 
 def main() -> None:
     """Entry point for step 02 (MVDR)."""
     ensure_output_dirs()
 
     enh_cfg = CFG.get("enhancement", {})
-    diag_load = enh_cfg.get("mvdr_diagonal_loading", 1e-6)
+    diag_load = float(enh_cfg.get("mvdr_diagonal_loading", 1e-6))
+    steering_mode = enh_cfg.get("steering_mode", "doa_model")
+    use_interferer_nulling = enh_cfg.get("use_interferer_nulling", False)
+    segment_steering = enh_cfg.get("segment_steering", False)
+    block_frames = int(enh_cfg.get("steering_block_frames", 200))
 
-    # Load tracks
+    stft_params = get_stft_params()
+    n_fft = stft_params["n_fft"]
+    sr = SAMPLE_RATE
+    channel_order = get_channel_order()
+
+    # ── Load tracks ────────────────────────────────────────────────────
     tracks_path = DOA_DIR / "doa_tracks.json"
-    if tracks_path.exists():
-        scene = load_json(tracks_path)
-        candidates = scene.get("candidates", [])
-    else:
-        candidates = []
-        logger.warning("No DoA tracks found – nothing to beamform.")
+    if not tracks_path.exists():
+        raise FileNotFoundError(f"[member2][mvdr] not found: {tracks_path}")
+    with open(tracks_path, "r", encoding="utf-8") as fh:
+        scene = json.load(fh)
+    candidates = scene.get("candidates", [])
+    if not candidates:
+        logger.warning("[member2][mvdr] no candidates — nothing to do.")
+        return
+    logger.info("[member2][mvdr] %d candidate(s)  steering=%s",
+                len(candidates), steering_mode)
 
-    # Load STFT
+    # ── Load calibration (for doa_model steering) ──────────────────────
+    calibration = None
+    if steering_mode == "doa_model":
+        calib_path = CALIB_DIR / "calibration.json"
+        if calib_path.exists():
+            with open(calib_path, "r", encoding="utf-8") as fh:
+                calibration = json.load(fh)
+            if "delay_model" not in calibration:
+                logger.warning("[member2][mvdr] calibration has no "
+                               "delay_model — falling back to eigen")
+                calibration = None
+        else:
+            logger.warning("[member2][mvdr] calibration.json not found "
+                           "— falling back to eigen")
+
+    # ── Load STFT ──────────────────────────────────────────────────────
     wpe_path = INTERMEDIATE_DIR / "mixture_stft_wpe.npy"
     raw_path = INTERMEDIATE_DIR / "mixture_stft.npy"
     stft_path = wpe_path if wpe_path.exists() else raw_path
+    stft = np.load(str(stft_path))
+    n_ch, n_freq, n_frames = stft.shape
+    logger.info("[member2][mvdr] STFT %s from %s", stft.shape, stft_path.name)
 
-    if stft_path.exists():
-        stft = np.load(str(stft_path))
-    else:
-        stft = np.zeros((4, 513, 100), dtype=np.complex64)
+    mix_power = np.mean(np.abs(stft[0]) ** 2)
 
+    # ── Load all masks ─────────────────────────────────────────────────
+    all_masks = {}
     for cand in candidates:
         cid = cand.get("id", "spk00")
         mask_path = INTERMEDIATE_DIR / f"{cid}_mask.npy"
         if mask_path.exists():
-            mask = np.load(str(mask_path))
+            all_masks[cid] = np.load(str(mask_path)).astype(np.float64)
         else:
-            mask = np.ones((stft.shape[1], stft.shape[2]), dtype=np.float32)
+            logger.warning("[member2][mvdr] mask %s missing — all-ones", cid)
+            all_masks[cid] = np.ones((n_freq, n_frames), dtype=np.float64)
 
+    # ── Per-candidate MVDR ─────────────────────────────────────────────
+    for cand in candidates:
+        cid = cand.get("id", "spk00")
+        mean_az = float(cand.get("mean_azimuth", 0.0))
+        mask = all_masks[cid]
+
+        # Target covariance
         cov_target = estimate_covariance(stft, mask)
-        cov_noise = estimate_covariance(stft, 1.0 - mask)
-        steer = compute_steering_vector(cov_target)
-        enhanced = mvdr_beamform(stft, steer, cov_noise,
-                                  diagonal_loading=diag_load)
 
+        # Noise covariance
+        if use_interferer_nulling and len(candidates) > 1:
+            other = [all_masks[c.get("id")] for c in candidates
+                     if c.get("id") != cid]
+            noise_mask = np.clip(np.maximum.reduce(other), 0.0, 1.0)
+        else:
+            noise_mask = 1.0 - mask
+        cov_noise = estimate_covariance(stft, noise_mask)
+
+        # ── Steering vector ────────────────────────────────────────────
+        mic_delays = None
+        actual_mode = steering_mode
+
+        if steering_mode == "doa_model" and calibration is not None:
+            if segment_steering:
+                # Per-block steering: adapt direction across time
+                blocks = _get_block_azimuths(cand, n_frames, block_frames)
+                enhanced = np.zeros((n_freq, n_frames), dtype=np.complex128)
+                weights = None
+
+                for b_start, b_end, b_az in blocks:
+                    try:
+                        b_steer, mic_delays = compute_steering_doa_model(
+                            b_az, calibration, n_freq, n_fft, sr,
+                            channel_order,
+                        )
+                    except Exception:
+                        b_steer = compute_steering_eigen(cov_target)
+
+                    b_enh, b_w = mvdr_beamform(
+                        stft[:, :, b_start:b_end], b_steer, cov_noise,
+                        diagonal_loading=diag_load,
+                    )
+                    enhanced[:, b_start:b_end] = b_enh
+                    if weights is None:
+                        weights = b_w
+
+                actual_mode = "doa_model_segment"
+                n_blocks = len(blocks)
+                az_range = max(b[2] for b in blocks) - min(b[2] for b in blocks)
+
+                # Single steering vector for debug output
+                try:
+                    steer, _ = compute_steering_doa_model(
+                        mean_az, calibration, n_freq, n_fft, sr,
+                        channel_order,
+                    )
+                except Exception:
+                    steer = compute_steering_eigen(cov_target)
+            else:
+                try:
+                    steer, mic_delays = compute_steering_doa_model(
+                        mean_az, calibration, n_freq, n_fft, sr,
+                        channel_order,
+                    )
+                except Exception as exc:
+                    logger.warning("[member2][mvdr] %s doa_model failed "
+                                   "(%s) — fallback to eigen", cid, exc)
+                    steer = compute_steering_eigen(cov_target)
+                    actual_mode = "eigen"
+
+                enhanced, weights = mvdr_beamform(
+                    stft, steer, cov_noise, diagonal_loading=diag_load,
+                )
+        else:
+            steer = compute_steering_eigen(cov_target)
+            actual_mode = "eigen"
+            enhanced, weights = mvdr_beamform(
+                stft, steer, cov_noise, diagonal_loading=diag_load,
+            )
+
+        enh_power = float(np.mean(np.abs(enhanced) ** 2))
+        power_ratio = enh_power / (mix_power + 1e-12)
+
+        # Save enhanced STFT
         out_path = SEPARATED_DIR / f"{cid}_enhanced_stft.npy"
         np.save(str(out_path), enhanced)
-        logger.info("MVDR result for %s saved → %s", cid, out_path)
 
-    logger.info("Step 02 (MVDR) complete.")
+        # Save debug NPZ
+        debug = dict(
+            steering_mode=np.array(actual_mode),
+            mean_azimuth=np.array(mean_az),
+            mask=mask.astype(np.float32),
+            steer=steer,
+            weights=weights,
+            cov_target=cov_target,
+            cov_noise=cov_noise,
+            mix_power=np.array(mix_power),
+            enh_power=np.array(enh_power),
+        )
+        if mic_delays is not None:
+            debug["relative_mic_delays"] = mic_delays
+        np.savez_compressed(
+            str(SEPARATED_DIR / f"{cid}_debug.npz"), **debug)
+
+        if actual_mode == "doa_model_segment":
+            logger.info("[member2][mvdr] %s: steering=%s  az=%.1f  "
+                        "blocks=%d  az_range=%.1f°  power_ratio=%.2f",
+                        cid, actual_mode, mean_az, n_blocks,
+                        az_range, power_ratio)
+        else:
+            logger.info("[member2][mvdr] %s: steering=%s  az=%.1f  "
+                        "power_ratio=%.2f",
+                        cid, actual_mode, mean_az, power_ratio)
+
+    logger.info("[member2][mvdr] done — %d candidate(s)", len(candidates))
 
 
 if __name__ == "__main__":

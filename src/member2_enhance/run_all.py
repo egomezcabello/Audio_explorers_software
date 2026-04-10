@@ -30,7 +30,7 @@ def main() -> None:
     ]
 
     logger.info("=" * 60)
-    logger.info("Member 2 – Enhancement pipeline  (4 steps)")
+    logger.info("[member2] Enhancement pipeline  (4 steps)")
     logger.info("=" * 60)
 
     for label, module_name in steps:
@@ -39,12 +39,12 @@ def main() -> None:
             mod = importlib.import_module(module_name)
             mod.main()
         except Exception as exc:
-            logger.error("Step '%s' failed: %s", label, exc)
+            logger.error("[member2] Step '%s' failed: %s", label, exc)
             traceback.print_exc()
             sys.exit(1)
 
     logger.info("=" * 60)
-    logger.info("Member 2 pipeline complete ✓")
+    logger.info("[member2] pipeline complete")
     logger.info("=" * 60)
 
 
