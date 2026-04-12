@@ -108,6 +108,9 @@ def main() -> None:
     female_child_hz = float(analysis_cfg.get("pitch_female_child_hz", 260.0))
     mask_floor = float(analysis_cfg.get("pitch_mask_floor", 0.0))
     pitch_percentile = int(analysis_cfg.get("pitch_percentile", 50))
+    mask_weight_exp = float(analysis_cfg.get("pitch_mask_weight_exponent", 1.0))
+    contam_std_hz = float(analysis_cfg.get("pitch_contamination_std_hz", 35.0))
+    contam_fallback_pct = int(analysis_cfg.get("pitch_contamination_fallback_percentile", 10))
 
     wav_files = sorted(SEPARATED_DIR.glob("*_enhanced.wav"))
     if not wav_files:
@@ -146,6 +149,11 @@ def main() -> None:
                     low_mask = weights_all < mask_floor
                     weights_all[low_mask] = 0.0
 
+                # C3b: Raise mask weights to exponent — emphasise
+                # high-confidence frames to suppress crosstalk
+                if mask_weight_exp != 1.0:
+                    weights_all = np.power(weights_all, mask_weight_exp)
+
                 weights = weights_all[voiced_idx]
                 logger.debug("  mask-weighted: %d voiced, mask %s",
                              len(voiced), mask.shape)
@@ -167,6 +175,40 @@ def main() -> None:
                 pr.std_f0_hz = float(
                     np.sqrt(np.average((voiced - w_mean) ** 2,
                                        weights=weights)))
+
+                # Contamination-aware fallback: if std is very high,
+                # the F0 distribution is likely bimodal from crosstalk.
+                # Use histogram mode detection to find the true F0 peak.
+                if pr.std_f0_hz > contam_std_hz:
+                    old_f0 = pr.median_f0_hz
+                    # Build weighted histogram of F0 values
+                    bin_edges = np.arange(50, 401, 5)  # 5-Hz bins
+                    hist_w, _ = np.histogram(voiced, bins=bin_edges,
+                                             weights=weights)
+                    bin_centres = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+                    # Smooth the histogram to find clean peaks
+                    from scipy.ndimage import gaussian_filter1d
+                    hist_smooth = gaussian_filter1d(hist_w, sigma=2.0)
+                    # Find all local maxima
+                    peaks = []
+                    for k in range(1, len(hist_smooth) - 1):
+                        if (hist_smooth[k] > hist_smooth[k - 1] and
+                                hist_smooth[k] > hist_smooth[k + 1] and
+                                hist_smooth[k] > 0.1 * hist_smooth.max()):
+                            peaks.append((bin_centres[k], hist_smooth[k]))
+                    if peaks:
+                        # Pick the peak closest to the weighted-P25 estimate
+                        # (which biases toward the lower/true mode)
+                        peaks.sort(key=lambda p: p[0])
+                        # If the lowest peak is well-separated, prefer it
+                        # (it's likely the true speaker, not crosstalk)
+                        pr.median_f0_hz = float(peaks[0][0])
+                        logger.info("  %s: bimodal F0 (std=%.1f Hz) → "
+                                    "mode detection: %.1f→%.1f Hz  "
+                                    "peaks=%s",
+                                    cid, pr.std_f0_hz, old_f0,
+                                    pr.median_f0_hz,
+                                    [f"{p[0]:.0f}" for p in peaks])
             else:
                 pr.median_f0_hz = float(np.percentile(voiced, pitch_percentile))
                 pr.std_f0_hz = float(np.std(voiced))

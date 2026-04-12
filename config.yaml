@@ -228,6 +228,9 @@ analysis:
   pitch_female_child_hz: 260      # above → child
   pitch_mask_floor: 0.3           # ignore frames with mask weight below this
   pitch_percentile: 25            # use P25 instead of median for robustness
+  pitch_mask_weight_exponent: 2.0 # raise mask weights to this power (emphasise high-confidence frames)
+  pitch_contamination_std_hz: 35  # if weighted F0 std exceeds this, suspect crosstalk
+  pitch_contamination_fallback_percentile: 10  # fallback percentile when contamination detected
 
 # ── Fusion ─────────────────────────────────────────────────────────────
 fusion:
