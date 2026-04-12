@@ -75,23 +75,43 @@ doa:
   weighting_mode: "pair_group_weighted"
 
   # Peak detection in step 03
-  top_k_peaks_per_frame: 3       # max peaks per frame (before gating)
-  min_peak_distance_deg: 40      # minimum separation between peaks
+  top_k_peaks_per_frame: 4       # max peaks per frame (before gating)
+  min_peak_distance_deg: 30      # minimum separation between peaks
   peak_rel_threshold: 0.15       # peaks must exceed this fraction of max
-  second_peak_ratio: 0.50        # 2nd+ peaks must be ≥ 50% of strongest
+  second_peak_ratio: 0.40        # 2nd+ peaks must be ≥ 40% of strongest
+
+  # Temporal persistence rescue — secondary peaks that recur at a similar
+  # angle in neighbouring frames are rescued even if they fail the height gate.
+  temporal_persist_window: 5     # half-window of frames to check
+  temporal_persist_count: 3      # must appear in ≥ N of those frames
+  temporal_persist_tol_deg: 8.0  # angular tolerance for "same angle"
 
   # Global-direction tracking
   # Step 03 uses time-averaged power to find stable speaker directions,
   # then assigns per-frame peaks to these directions.  This avoids the
   # over-fragmentation that DBSCAN produces on intermittent speakers.
-  global_peak_prominence: 0.10   # prominence for global direction peaks
-  max_assign_dist_deg: 25.0      # max angular distance for assignment
+  global_peak_prominence: 0.075  # prominence for global direction peaks
+  max_assign_dist_deg: 20.0      # max angular distance for assignment
   smooth_track_sigma: 5          # Gaussian smoothing of tracks (frames)
 
   # Track quality filtering
-  min_track_points_frac: 0.03    # min points as fraction of n_frames
+  min_track_points_frac: 0.05    # min points as fraction of n_frames
   min_track_duration_s: 0.5      # min total active duration (seconds)
-  min_track_score_ratio: 0.15    # min mean_score / best_track_mean_score
+  # min_track_score_ratio: 0.55  # (replaced by burst + pair-group filtering)
+
+  # Smart filtering — local burst + pair-group evidence
+  burst_window_s: 1.0            # window for local burst analysis (seconds)
+  burst_score_ratio: 0.50        # mean_top3 must be >= this × best track's
+  burst_abs_floor: 0.0           # absolute minimum burst score (keeps weak tracks)
+  burst_percentile: 40.0         # percentile-based burst floor across all tracks
+  min_group_count: 2             # confirmed if >= N pair groups support it
+  group_threshold_ratio: 0.40    # group score threshold = ratio × best
+  group_abs_threshold: 0.10      # absolute floor for pair-group support
+
+  # Track merging — rejoin tracks that are close in angle AND overlapping
+  # in time (targets the "one speaker split into two confirmed" failure)
+  merge_max_sep_deg: 12.0        # max angular separation to consider merge
+  merge_min_temporal_iou: 0.60   # min temporal IoU to trigger merge
 
   # Windowed discovery – catches intermittent speakers the global average misses
   use_windowed_discovery: true
@@ -103,15 +123,38 @@ doa:
   split_broad_tracks: true
   track_split_std_deg: 18.0      # circular std threshold to trigger split
   track_split_min_points: 30     # both subtracks must have ≥ N points
+  presplit_max_temporal_overlap: 0.70  # reject split if sub-cluster temporal IoU > this
 
   # Diffuseness rejection – removes garbage tracks with excessive spread
   reject_diffuse_std_deg: 30.0   # reject tracks with angular std > this
+
+  # Dual-map tracking – SRP-norm for discovery, hybrid for scoring
+  use_dual_map_tracking: true
+
+  # Discovery thresholds – more permissive to find all candidate directions
+  discovery_global_rel_threshold: 0.07
+  discovery_global_prominence: 0.10
+  discovery_max_global_dirs: 10
+  windowed_rel_threshold: 0.15
+  discovery_max_windowed_dirs: 6
+  discovery_merge_sep_deg: 15.0
+
+  # Residual discovery – finds directions missed by global + windowed
+  use_residual_discovery: true
+  residual_num_passes: 2
+  residual_min_support_frames: 50
+  residual_merge_sep_deg: 15.0
+  discovery_max_total_dirs: 14
+
+  # Second-pass track splitting
+  track_second_pass_split: true
+  track_second_pass_min_sep_deg: 15.0
 
   # Calibration
   calibration_n_clusters: 4      # number of speaker directions to learn
   calibration_source: "example"  # tag of the WAV used for calibration
   calibration_energy_quantile: 0.30        # reject bottom 30% frames by energy
-  calibration_confidence_quantile: 0.50    # among energy-passing, keep top 50% by confidence
+  calibration_confidence_quantile: 0.30    # among energy-passing, keep top 30% by confidence
   calibration_max_frames: null             # optional hard cap (null = no cap)
 
   # Balanced refinement — after initial clustering, cap each direction
@@ -122,9 +165,12 @@ doa:
 
   # Hybrid DoA scoring — combine SRP-PHAT with delay-domain template match
   use_hybrid_doa_score: true           # enable hybrid SRP + template scoring
-  template_score_weight: 0.30          # blend: 0.70*SRP + 0.30*template
-  delay_mismatch_sigma_us: 25.0        # Gaussian kernel width in µs (25 is forgiving
-                                       # enough for overlapping speech; 15 was too strict)
+  template_score_weight: 0.20          # blend: 0.80*SRP + 0.20*template
+  delay_mismatch_sigma_us: 15.0        # Gaussian kernel width in µs
+
+  # Dynamic reliability weighting — per-frame, per-pair confidence gates
+  # noisy cross-correlations so they don't pollute SRP sidelobes
+  use_reliability_weighting: true
 
 # ── Enhancement ────────────────────────────────────────────────────────
 enhancement:
@@ -137,6 +183,9 @@ enhancement:
   mask_floor: 0.0
   use_spatial_masks: true
   mask_exponent: 3.0
+  include_provisionals: true
+  provisional_min_score: 0.75
+  provisional_min_duration_s: 5.0
   spatial_pilot_threshold: 0.90
   use_interferer_nulling: true
   steering_mode: "doa_model"        # "doa_model" or "eigen"

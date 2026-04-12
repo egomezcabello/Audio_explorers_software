@@ -58,12 +58,82 @@ def run_vad(
     - Merge adjacent segments with small gaps.
     - Filter by minimum duration.
     """
-    # TODO: Implement VAD
-    logger.warning("run_vad() is a placeholder – returning full duration as speech.")
+    import webrtcvad
+
     duration = len(audio) / sr
-    if duration > 0:
-        return [(0.0, duration)]
-    return []
+    if duration <= 0:
+        return []
+
+    # ── Resample to a rate accepted by webrtcvad ──────────────────────
+    TARGET_SR = 16_000
+    if sr != TARGET_SR:
+        import librosa
+        audio_rs = librosa.resample(audio.astype(np.float32), orig_sr=sr, target_sr=TARGET_SR)
+        work_sr = TARGET_SR
+    else:
+        audio_rs = audio
+        work_sr = sr
+
+    # Convert to 16-bit PCM
+    pcm = (np.clip(audio_rs, -1.0, 1.0) * 32767).astype(np.int16)
+
+    # ── Frame-level VAD decisions ─────────────────────────────────────
+    vad = webrtcvad.Vad(mode)
+    frame_length = int(work_sr * frame_duration_ms / 1000)  # samples per frame
+    frame_bytes = frame_length * 2  # 16-bit = 2 bytes/sample
+    n_frames = len(pcm) // frame_length
+
+    is_speech = []
+    for i in range(n_frames):
+        start = i * frame_length
+        chunk = pcm[start : start + frame_length].tobytes()
+        if len(chunk) < frame_bytes:
+            break
+        try:
+            is_speech.append(vad.is_speech(chunk, work_sr))
+        except Exception:
+            is_speech.append(False)
+
+    if not is_speech:
+        return []
+
+    # ── Group contiguous speech frames into segments ──────────────────
+    frame_dur = frame_duration_ms / 1000.0
+    raw_segments: List[Tuple[float, float]] = []
+    in_seg = False
+    seg_start = 0.0
+    for idx, sp in enumerate(is_speech):
+        t = idx * frame_dur
+        if sp and not in_seg:
+            seg_start = t
+            in_seg = True
+        elif not sp and in_seg:
+            raw_segments.append((seg_start, t))
+            in_seg = False
+    if in_seg:
+        raw_segments.append((seg_start, min(n_frames * frame_dur, duration)))
+
+    if not raw_segments:
+        return []
+
+    # ── Merge segments separated by small gaps ────────────────────────
+    GAP_MERGE = 0.10  # seconds
+    merged: List[Tuple[float, float]] = [raw_segments[0]]
+    for s, e in raw_segments[1:]:
+        prev_s, prev_e = merged[-1]
+        if s - prev_e <= GAP_MERGE:
+            merged[-1] = (prev_s, e)
+        else:
+            merged.append((s, e))
+
+    # ── Remove segments shorter than min_speech_duration_s ────────────
+    min_dur = CFG.get("analysis", {}).get("min_speech_duration_s", 0.3)
+    segments = [(s, e) for s, e in merged if (e - s) >= min_dur]
+
+    logger.info("VAD: %d raw → %d merged → %d final segments (%.1f s speech / %.1f s total)",
+                len(raw_segments), len(merged), len(segments),
+                sum(e - s for s, e in segments), duration)
+    return segments
 
 
 def save_vad_results(

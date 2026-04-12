@@ -284,6 +284,20 @@ def main() -> None:
     with open(tracks_path, "r", encoding="utf-8") as fh:
         scene = json.load(fh)
     candidates = scene.get("candidates", [])
+
+    # ── Optionally include provisional candidates ──────────────────
+    if enh_cfg.get("include_provisionals", False):
+        min_score = float(enh_cfg.get("provisional_min_score", 0.75))
+        min_dur = float(enh_cfg.get("provisional_min_duration_s", 5.0))
+        provs = scene.get("provisional_candidates", [])
+        accepted = [p for p in provs
+                    if p.get("mean_score", 0) >= min_score
+                    and p.get("total_duration_s", 0) >= min_dur]
+        if accepted:
+            logger.info("[member2][mvdr] including %d/%d provisionals",
+                        len(accepted), len(provs))
+            candidates = candidates + accepted
+
     if not candidates:
         logger.warning("[member2][mvdr] no candidates — nothing to do.")
         return

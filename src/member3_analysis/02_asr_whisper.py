@@ -31,6 +31,7 @@ def transcribe(
     audio_path: Path,
     model_size: str = "large-v3",
     language: Optional[str] = None,
+    _model_cache: dict = {},
 ) -> str:
     """
     Transcribe a WAV file using faster-whisper.
@@ -48,16 +49,60 @@ def transcribe(
     -------
     transcript : str
         Full transcription text.
-
-    TODO
-    ----
-    - Load faster_whisper.WhisperModel (with device/compute_type config).
-    - Run model.transcribe() and collect segments.
-    - Concatenate segment texts.
     """
-    # TODO: Implement Whisper transcription
-    logger.warning("transcribe() is a placeholder – returning empty string.")
-    return ""
+    from faster_whisper import WhisperModel
+    from src.common.paths import WHISPER_MODEL_DIR
+
+    # ── Load model (cached across calls) ──────────────────────────────
+    if "model" not in _model_cache:
+        try:
+            import torch
+            has_cuda = torch.cuda.is_available()
+        except ImportError:
+            has_cuda = False
+
+        device = "cuda" if has_cuda else "cpu"
+        compute_type = "float16" if has_cuda else "float32"
+        logger.info("Loading Whisper model '%s' (device=%s, compute=%s)",
+                     model_size, device, compute_type)
+        _model_cache["model"] = WhisperModel(
+            model_size,
+            device=device,
+            compute_type=compute_type,
+            download_root=str(WHISPER_MODEL_DIR),
+        )
+    model = _model_cache["model"]
+
+    # ── Transcribe ────────────────────────────────────────────────────
+    # Force English — all speakers are known to be English
+    lang_hint = "en"
+
+    try:
+        segments, info = model.transcribe(
+            str(audio_path),
+            beam_size=5,
+            language=lang_hint,
+            no_speech_threshold=0.6,
+            log_prob_threshold=-1.0,
+            compression_ratio_threshold=2.4,
+            word_timestamps=True,
+            condition_on_previous_text=False,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 500},
+        )
+        # Materialise the generator and concatenate text
+        texts = []
+        for seg in segments:
+            texts.append(seg.text)
+        transcript = " ".join(texts).strip()
+
+        logger.info("Whisper: lang=%s prob=%.2f, %d chars",
+                     info.language, info.language_probability, len(transcript))
+        return transcript
+
+    except Exception as exc:
+        logger.error("Whisper transcription failed for %s: %s", audio_path, exc)
+        return ""
 
 
 def main() -> None:
@@ -90,6 +135,10 @@ def main() -> None:
         out_path = ANALYSIS_DIR / f"{cid}_transcript.txt"
         out_path.write_text(transcript, encoding="utf-8")
         logger.info("Transcript saved → %s (%d chars)", out_path, len(transcript))
+
+        # Free memory between files to avoid OOM with large models
+        import gc
+        gc.collect()
 
     logger.info("Step 02 (ASR) complete.")
 

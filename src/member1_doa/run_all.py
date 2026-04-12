@@ -52,7 +52,19 @@ def main() -> None:
         "--tags", nargs="+", default=None,
         help="Input tags to process (default: auto-detect from intermediate STFTs)",
     )
+    parser.add_argument(
+        "--sweep", action="store_true", default=False,
+        help="Run parameter sweep / tuning instead of the normal pipeline",
+    )
     args = parser.parse_args()
+
+    if args.sweep:
+        import importlib, sys
+        mod = importlib.import_module("src.member1_doa.05_sweep_tuning")
+        logger.info("Delegating to sweep / tuning script ...")
+        sys.argv = [sys.argv[0]]  # reset argv so sweep's argparse works
+        mod.main()
+        return
 
     logger.info("=" * 60)
     logger.info("Member 1 – DoA pipeline")

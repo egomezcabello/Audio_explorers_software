@@ -227,6 +227,8 @@ def srp_phat(
     n_grid: int = 360,
     freq_range: Tuple[int, int] = (300, 8000),
     batch_size: int = 50,
+    pair_weights_override: Optional[np.ndarray] = None,
+    frame_confidences: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Compute the pair-weighted SRP-PHAT angular power spectrum.
@@ -244,6 +246,14 @@ def srp_phat(
         Band-pass frequency range in Hz.
     batch_size : int
         Frames per processing batch (memory control).
+    pair_weights_override : np.ndarray or None
+        Static pair weights (length 6), overriding config.
+    frame_confidences : np.ndarray or None, shape (n_frames, n_pairs)
+        Per-frame per-pair GCC-PHAT confidence (0–1).  When provided,
+        the static pair weight is multiplied by the frame-level
+        confidence, so that unreliable pairs contribute less to
+        spurious SRP agreement on that frame.  This tends to reduce
+        sidelobes/local maxima caused by noisy pair cross-correlations.
 
     Returns
     -------
@@ -260,7 +270,9 @@ def srp_phat(
     stft_sub = stft[:, f_mask, :]         # (n_ch, n_sub_freq, n_frames)
 
     ch_idx = {name: i for i, name in enumerate(CHANNEL_ORDER)}
-    pair_weights = get_pair_weights()
+    pair_weights = (pair_weights_override
+                    if pair_weights_override is not None
+                    else get_pair_weights())
 
     logger.debug("  Pair weights: %s",
                 {f"{m1}_{m2}": pair_weights[p]
@@ -275,6 +287,10 @@ def srp_phat(
         phase = np.exp(-1j * 2 * np.pi * freqs_hz[None, :] * tau[:, None])
         steer_phases.append(phase)
 
+    # Pre-compute dynamic per-frame weights if confidence is available
+    use_dynamic = (frame_confidences is not None
+                   and frame_confidences.shape[0] == n_frames)
+
     # Allocate output
     P = np.zeros((n_grid, n_frames), dtype=np.float64)
 
@@ -285,8 +301,8 @@ def srp_phat(
         t1 = min(t0 + batch_size, n_frames)
 
         for p_idx, (m1, m2) in enumerate(ALL_MIC_PAIRS):
-            w = pair_weights[p_idx]
-            if w == 0.0:
+            w_static = pair_weights[p_idx]
+            if w_static == 0.0:
                 continue
 
             i1, i2 = ch_idx[m1], ch_idx[m2]
@@ -300,7 +316,13 @@ def srp_phat(
 
             # Steer and sum over frequency
             steered = steer_phases[p_idx] @ G_phat   # (n_grid, batch)
-            P[:, t0:t1] += w * np.real(steered)
+
+            if use_dynamic:
+                # Per-frame weight = static_weight × frame_confidence
+                w_dyn = w_static * frame_confidences[t0:t1, p_idx]  # (batch,)
+                P[:, t0:t1] += np.real(steered) * w_dyn[np.newaxis, :]
+            else:
+                P[:, t0:t1] += w_static * np.real(steered)
 
         if (b + 1) % 20 == 0 or b == n_batches - 1:
             logger.debug("  SRP-PHAT batch %d/%d", b + 1, n_batches)
@@ -641,24 +663,45 @@ def main(tag: str = "mixture") -> None:
         calib = None
         delays = compute_geometry_delays(n_grid)
 
-    # ── SRP-PHAT ──────────────────────────────────────────────────────
-    logger.info("[%s][doa] SRP-PHAT (n_grid=%d, freq=[%d,%d] Hz) ...",
-                tag, n_grid, *freq_range)
-    P_srp = srp_phat(stft, delays, n_grid=n_grid, freq_range=freq_range)
+    # ── Config: dynamic reliability weighting ───────────────────────────
+    use_reliability_weighting = bool(doa_cfg.get(
+        "use_reliability_weighting", True))
 
-    # ── Template-consistency scoring (optional) ───────────────────────
+    # ── SRP-PHAT ──────────────────────────────────────────────────────
+    # If reliability weighting is enabled and we have hybrid scoring,
+    # we compute frame delays/confidences first and use them for both
+    # SRP weighting and template scoring.
+    frame_confs_for_srp = None
+    frame_delays = None
+    frame_confs = None
+
     if use_hybrid and calib is not None:
-        logger.info("[%s][doa] template-consistency "
-                    "(σ=%.0fµs, weight=%.2f) ...",
-                    tag, delay_sigma_us, template_weight)
+        logger.info("[%s][doa] computing per-frame delays & "
+                    "confidences ...", tag)
         frame_delays, frame_confs = compute_frame_delays(stft, freq_range)
-        pair_weights = get_pair_weights()
 
         logger.debug("[%s][doa] frame_delay_conf: mean=%.3f min=%.3f "
                      "max=%.3f", tag,
                      float(frame_confs.mean()),
                      float(frame_confs.min()),
                      float(frame_confs.max()))
+
+        if use_reliability_weighting:
+            frame_confs_for_srp = frame_confs
+            logger.info("[%s][doa] dynamic reliability weighting "
+                        "enabled for SRP", tag)
+
+    logger.info("[%s][doa] SRP-PHAT (n_grid=%d, freq=[%d,%d] Hz) ...",
+                tag, n_grid, *freq_range)
+    P_srp = srp_phat(stft, delays, n_grid=n_grid, freq_range=freq_range,
+                     frame_confidences=frame_confs_for_srp)
+
+    # ── Template-consistency scoring (optional) ───────────────────────
+    if use_hybrid and calib is not None:
+        logger.info("[%s][doa] template-consistency "
+                    "(σ=%.0fµs, weight=%.2f) ...",
+                    tag, delay_sigma_us, template_weight)
+        pair_weights = get_pair_weights()
 
         P_tmpl = template_consistency_map(
             frame_delays, delays, pair_weights,
@@ -689,6 +732,7 @@ def main(tag: str = "mixture") -> None:
         frame_max = P_srp.max(axis=0, keepdims=True)
         frame_max = np.where(frame_max > 0, frame_max, 1.0)
         P_norm = P_srp / frame_max
+        P_srp_norm = P_norm  # Without hybrid, SRP-norm is the canonical map
 
     # ── Validation / comparison ───────────────────────────────────────
     if tag == "example":
@@ -713,11 +757,68 @@ def main(tag: str = "mixture") -> None:
     srp_path = DOA_DIR / f"{tag}_doa_posteriors_srp.npy"
     np.save(str(srp_path), P_srp)
 
+    # SRP-norm (per-frame normalised SRP — used for dual-map discovery)
+    srp_norm_path = DOA_DIR / f"{tag}_doa_posteriors_srp_norm.npy"
+    np.save(str(srp_norm_path), P_srp_norm)
+
+    # Hybrid with explicit name (same as canonical, for dual-map scoring)
+    hybrid_path = DOA_DIR / f"{tag}_doa_posteriors_hybrid.npy"
+    np.save(str(hybrid_path), P_norm)
+
     if tag == "mixture":
         canonical_path = DOA_DIR / "doa_posteriors.npy"
         np.save(str(canonical_path), P_norm)
 
-    logger.info("[%s][doa] saved -> %s  (+ srp)", tag, tag_path)
+    logger.info("[%s][doa] saved -> %s  (+ srp, srp_norm, hybrid)", tag, tag_path)
+
+    # ── Debug posteriors with preserved dynamic range ─────────────────
+    # These give the tracker a better observation space for direction
+    # discovery: the per-frame max-normalized maps compress amplitude
+    # dynamics, which systematically hides intermittent/weak speakers.
+    eps = 1e-10
+
+    # Log-scale SRP (preserves dynamic range)
+    P_srp_log = np.log(np.maximum(P_srp, eps))
+    np.save(str(DOA_DIR / f"{tag}_doa_posteriors_srp_log.npy"), P_srp_log)
+
+    # Frame-wise z-score (mean=0, std=1 per frame); highlights outlier
+    # directions without collapsing absolute energy differences
+    frame_mean = P_srp.mean(axis=0, keepdims=True)
+    frame_std = P_srp.std(axis=0, keepdims=True)
+    frame_std = np.where(frame_std > eps, frame_std, 1.0)
+    P_srp_zscore = (P_srp - frame_mean) / frame_std
+    np.save(str(DOA_DIR / f"{tag}_doa_posteriors_srp_zscore.npy"),
+            P_srp_zscore)
+
+    logger.info("[%s][doa] saved debug posteriors (srp_log, srp_zscore)",
+                tag)
+
+    # ── Per-group SRP maps ────────────────────────────────────────────
+    base_weights = get_pair_weights()
+    group_pairs = {
+        "on_ear":   [0, 1],     # LF-LR, RF-RR
+        "lateral":  [2, 3],     # LF-RF, LR-RR
+        "diagonal": [4, 5],     # LF-RR, LR-RF
+    }
+    for grp, idxs in group_pairs.items():
+        gw = np.zeros_like(base_weights)
+        for pi in idxs:
+            gw[pi] = base_weights[pi]
+        P_grp = srp_phat(stft, delays, n_grid=n_grid,
+                         freq_range=freq_range,
+                         pair_weights_override=gw)
+        gmax = P_grp.max(axis=0, keepdims=True)
+        gmax = np.where(gmax > 0, gmax, 1.0)
+        P_grp_norm = P_grp / gmax
+        np.save(str(DOA_DIR / f"{tag}_doa_posteriors_{grp}.npy"),
+                P_grp_norm)
+
+    # ── Extraction map (conservative fusion of disc + hybrid) ─────────
+    P_extract = np.sqrt(np.maximum(P_srp_norm, 0.0) *
+                        np.maximum(P_norm, 0.0))
+    np.save(str(DOA_DIR / f"{tag}_doa_posteriors_extract.npy"), P_extract)
+
+    logger.info("[%s][doa] saved per-group + extract maps", tag)
 
 
 if __name__ == "__main__":

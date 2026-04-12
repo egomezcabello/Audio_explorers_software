@@ -22,7 +22,7 @@ import numpy as np
 
 from src.common.constants import SAMPLE_RATE
 from src.common.logging_utils import setup_logging
-from src.common.paths import ANALYSIS_DIR, SEPARATED_DIR, ensure_output_dirs
+from src.common.paths import ANALYSIS_DIR, INTERMEDIATE_DIR, SEPARATED_DIR, ensure_output_dirs
 
 logger = setup_logging(__name__)
 
@@ -56,15 +56,26 @@ def estimate_pitch(
     -------
     f0 : np.ndarray
         Frame-wise F0 in Hz (0 for unvoiced frames).
-
-    TODO
-    ----
-    - Implement using ``librosa.pyin`` or similar.
     """
-    # TODO: Implement pitch estimation
-    logger.warning("estimate_pitch() is a placeholder – returning zeros.")
-    n_frames = max(1, len(audio) // 512)
-    return np.zeros(n_frames, dtype=np.float64)
+    import librosa
+
+    try:
+        f0, voiced_flag, _ = librosa.pyin(
+            audio.astype(np.float32),
+            sr=sr,
+            fmin=50,
+            fmax=600,
+            hop_length=512,
+            fill_na=0.0,
+        )
+        if f0 is None:
+            n_frames = max(1, len(audio) // 512)
+            return np.zeros(n_frames, dtype=np.float64)
+        return np.nan_to_num(f0, nan=0.0).astype(np.float64)
+    except Exception as exc:
+        logger.warning("pyin failed: %s – returning zeros", exc)
+        n_frames = max(1, len(audio) // 512)
+        return np.zeros(n_frames, dtype=np.float64)
 
 
 def classify_voice_type(median_f0: float) -> str:
@@ -80,9 +91,9 @@ def classify_voice_type(median_f0: float) -> str:
     """
     if median_f0 <= 0:
         return "unknown"
-    if median_f0 < 165:
+    if median_f0 < 150:
         return "male"
-    if median_f0 < 255:
+    if median_f0 < 220:
         return "female"
     return "child"
 
@@ -106,18 +117,54 @@ def main() -> None:
         audio, sr = sf.read(str(wav_path), dtype="float64")
 
         f0 = estimate_pitch(audio, sr)
-        voiced = f0[f0 > 0]
+        voiced_idx = np.where(f0 > 0)[0]
+        voiced = f0[voiced_idx]
+
+        # Load beamforming mask for weighted statistics
+        mask_path = INTERMEDIATE_DIR / f"{cid}_mask.npy"
+        weights = None
+        if mask_path.exists():
+            mask = np.load(str(mask_path))       # (n_freq, n_frames_stft)
+            mask_mean = mask.mean(axis=0)         # average across frequency
+            n_pitch = len(f0)
+            n_stft = len(mask_mean)
+            if n_pitch > 0 and n_stft > 0:
+                weights_all = np.interp(
+                    np.linspace(0, 1, n_pitch),
+                    np.linspace(0, 1, n_stft),
+                    mask_mean,
+                )
+                weights = weights_all[voiced_idx]
+                logger.debug("  mask-weighted: %d voiced, mask %s",
+                             len(voiced), mask.shape)
 
         pr = PitchResult(candidate_id=cid)
         if len(voiced) > 0:
-            pr.median_f0_hz = float(np.median(voiced))
-            pr.std_f0_hz = float(np.std(voiced))
+            if (weights is not None and len(weights) == len(voiced)
+                    and weights.sum() > 1e-12):
+                # Weighted median
+                order = np.argsort(voiced)
+                sorted_f0 = voiced[order]
+                sorted_w = weights[order]
+                cum_w = np.cumsum(sorted_w)
+                pr.median_f0_hz = float(
+                    sorted_f0[np.searchsorted(cum_w, cum_w[-1] / 2.0)])
+                # Weighted std
+                w_mean = float(np.average(voiced, weights=weights))
+                pr.std_f0_hz = float(
+                    np.sqrt(np.average((voiced - w_mean) ** 2,
+                                       weights=weights)))
+            else:
+                pr.median_f0_hz = float(np.median(voiced))
+                pr.std_f0_hz = float(np.std(voiced))
             pr.min_f0_hz = float(np.min(voiced))
             pr.max_f0_hz = float(np.max(voiced))
         pr.voice_type = classify_voice_type(pr.median_f0_hz)
 
         results.append(pr)
-        logger.info("  → median F0=%.1f Hz, type=%s", pr.median_f0_hz, pr.voice_type)
+        logger.info("  → median F0=%.1f Hz, type=%s%s",
+                     pr.median_f0_hz, pr.voice_type,
+                     " (mask-weighted)" if weights is not None else "")
 
     # Save combined pitch results
     import json

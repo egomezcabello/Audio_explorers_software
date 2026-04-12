@@ -45,43 +45,62 @@ class CandidateScore:
 
 
 def score_doa_stability(doa_track: list) -> float:
-    """
-    Score DoA stability (low variance → high score).
-
-    TODO: Implement actual DoA variance computation.
-    """
-    # TODO: Implement
-    return 0.5  # placeholder neutral score
+    """Score DoA stability – low circular std → high score."""
+    if not doa_track or len(doa_track) < 2:
+        return 0.0
+    azimuths = [e[1] for e in doa_track if len(e) >= 2]
+    if len(azimuths) < 2:
+        return 0.0
+    az_rad = np.deg2rad(azimuths)
+    R = np.sqrt(np.mean(np.cos(az_rad)) ** 2 + np.mean(np.sin(az_rad)) ** 2)
+    circ_std_deg = np.rad2deg(np.sqrt(-2 * np.log(max(R, 1e-6))))
+    # 0° std → 1.0, 30° std → 0.0
+    return float(np.clip(1.0 - circ_std_deg / 30.0, 0.0, 1.0))
 
 
 def score_speech_duration(analysis: Dict[str, Any]) -> float:
-    """
-    Score based on total speech duration from VAD segments.
-
-    TODO: Implement – longer speech → higher score (normalised).
-    """
-    # TODO: Implement
-    return 0.5
+    """Score based on total speech duration from VAD segments."""
+    segments = analysis.get("vad_segments", [])
+    if not segments:
+        return 0.0
+    total = sum(seg[1] - seg[0] for seg in segments if len(seg) >= 2)
+    # Normalise: 15 s of speech in a 21 s clip → 1.0
+    return float(np.clip(total / 15.0, 0.0, 1.0))
 
 
 def score_language_match(analysis: Dict[str, Any], target_lang: str = "en") -> float:
-    """
-    Score based on language match to expected target.
-
-    TODO: Implement – exact match → 1.0, else lower.
-    """
-    # TODO: Implement
-    return 0.5
+    """Score based on language match to expected target."""
+    lang = analysis.get("language", "unknown")
+    conf = float(analysis.get("language_confidence", 0.0))
+    return conf if lang == target_lang else 0.0
 
 
 def score_snr(candidate_id: str) -> float:
-    """
-    Estimate SNR of the enhanced signal.
-
-    TODO: Implement SNR estimation.
-    """
-    # TODO: Implement
-    return 0.5
+    """Estimate SNR from the enhanced signal's energy distribution."""
+    wav_path = SEPARATED_DIR / f"{candidate_id}_enhanced.wav"
+    if not wav_path.exists():
+        return 0.0
+    try:
+        import soundfile as sf
+        audio, sr_ = sf.read(str(wav_path), dtype="float64")
+        frame_len = int(0.025 * sr_)  # 25 ms frames
+        n_frames = len(audio) // frame_len
+        if n_frames < 5:
+            return 0.5
+        energies = np.array([
+            np.mean(audio[i * frame_len:(i + 1) * frame_len] ** 2)
+            for i in range(n_frames)
+        ])
+        energies.sort()
+        noise_est = np.mean(energies[:max(1, n_frames // 5)])   # bottom 20 %
+        signal_est = np.mean(energies[n_frames // 2:])           # top 50 %
+        if noise_est < 1e-12:
+            return 1.0
+        snr_db = 10 * np.log10(signal_est / noise_est + 1e-12)
+        # 0 dB → 0.0, 30 dB → 1.0
+        return float(np.clip(snr_db / 30.0, 0.0, 1.0))
+    except Exception:
+        return 0.5
 
 
 def compute_total_score(scores: CandidateScore, weights: Dict[str, float]) -> float:

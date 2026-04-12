@@ -157,6 +157,8 @@ def plot_heatmap_with_tracks(
     # Overlay tracks
     if scene is not None:
         colors = plt.cm.tab10.colors
+        dt = t_sec[1] if len(t_sec) > 1 else 1.0
+        # Confirmed tracks (solid dots)
         for i, cand in enumerate(scene.get("candidates", [])):
             az_track = cand.get("azimuth_track", [])
             if not az_track:
@@ -164,12 +166,25 @@ def plot_heatmap_with_tracks(
             arr = np.array(az_track, dtype=float)
             valid = ~np.isnan(arr) if hasattr(arr, '__len__') else np.ones(len(arr), bool)
             frames = np.arange(len(arr))
-            t_track = frames * (t_sec[1] if len(t_sec) > 1 else 1.0)
+            t_track = frames * dt
             c = colors[i % len(colors)]
             ax.plot(t_track[valid], arr[valid], '.', color=c,
                     markersize=1.0, alpha=0.7,
                     label=f"{cand.get('id', '')} ({cand['mean_azimuth']:.0f}°)")
-        ax.legend(fontsize=8, loc="upper right", ncol=2,
+        # Provisional tracks (open circles, dimmer)
+        for j, prov in enumerate(scene.get("provisional_candidates", [])):
+            az_track = prov.get("azimuth_track", [])
+            if not az_track:
+                continue
+            arr = np.array(az_track, dtype=float)
+            valid = ~np.isnan(arr) if hasattr(arr, '__len__') else np.ones(len(arr), bool)
+            frames = np.arange(len(arr))
+            t_track = frames * dt
+            c = colors[(len(scene.get('candidates', [])) + j) % len(colors)]
+            ax.plot(t_track[valid], arr[valid], '.', color=c,
+                    markersize=0.6, alpha=0.35,
+                    label=f"prov {prov.get('id', '')} ({prov['mean_azimuth']:.0f}°)")
+        ax.legend(fontsize=7, loc="upper right", ncol=2,
                   markerscale=5, framealpha=0.8)
 
     save_path = DOA_DIR / f"{tag}_plot_heatmap_tracks.png"
@@ -207,6 +222,12 @@ def plot_avg_spectrum(
             ax.text(az, avg.max() * 0.95, f" {cand.get('id', '')}",
                     fontsize=8, color="red", rotation=90,
                     va="top", ha="left")
+        for prov in scene.get("provisional_candidates", []):
+            az = prov["mean_azimuth"]
+            ax.axvline(az, color="gray", alpha=0.5, linewidth=0.8, linestyle=":")
+            ax.text(az, avg.max() * 0.85, f" p{prov.get('id', '')}",
+                    fontsize=7, color="gray", rotation=90,
+                    va="top", ha="left")
 
     # Log dominant peaks
     from scipy.signal import find_peaks as _find_peaks
@@ -216,6 +237,148 @@ def plot_avg_spectrum(
         logger.info("[%s][viz] avg-spectrum peaks: %s", tag, pk_str)
 
     save_path = DOA_DIR / f"{tag}_plot_avg_spectrum.png"
+    save_figure(fig, save_path)
+    logger.info("[%s][viz] saved %s", tag, save_path.name)
+
+
+def plot_peak_count_histogram(
+    posteriors: np.ndarray,
+    scene: Optional[dict],
+    tag: str,
+    min_distance_deg: int = 30,
+) -> None:
+    """
+    Peak-count histogram: how often each angle was a top-1 or top-2
+    peak across frames.
+
+    This diagnostic directly corresponds to intermittent/late speakers
+    that the time-averaged spectrum hides: a direction that is rarely
+    the strongest but frequently the second-strongest will show up
+    here but not in the blue-line average.
+
+    Saves to ``outputs/doa/{tag}_plot_peak_histogram.png``.
+    """
+    from scipy.signal import find_peaks as _find_peaks
+
+    n_grid, n_frames = posteriors.shape
+    top1_hist = np.zeros(n_grid, dtype=np.float64)
+    top2_hist = np.zeros(n_grid, dtype=np.float64)
+
+    for t in range(n_frames):
+        spectrum = posteriors[:, t]
+        fmax = spectrum.max()
+        if fmax < 1e-8:
+            continue
+
+        pad = min_distance_deg + 2
+        tiled = np.concatenate([spectrum[-pad:], spectrum, spectrum[:pad]])
+        pks, props = _find_peaks(tiled, distance=min_distance_deg,
+                                 height=0.1 * fmax)
+        pks_orig = pks - pad
+        valid = (pks_orig >= 0) & (pks_orig < n_grid)
+        pks_orig = pks_orig[valid]
+        heights = props["peak_heights"][valid]
+
+        if len(pks_orig) == 0:
+            continue
+
+        order = np.argsort(heights)[::-1]
+        # Top-1 peak
+        top1_hist[pks_orig[order[0]]] += 1
+        # Top-2 peak (if exists)
+        if len(order) >= 2:
+            top2_hist[pks_orig[order[1]]] += 1
+
+    # Smooth slightly for readability
+    from scipy.ndimage import gaussian_filter1d as _gf1d
+    top1_smooth = _gf1d(top1_hist, sigma=2, mode='wrap')
+    top2_smooth = _gf1d(top2_hist, sigma=2, mode='wrap')
+
+    azimuths = np.arange(n_grid)
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.fill_between(azimuths, top1_smooth, alpha=0.4, color="steelblue",
+                    label="Top-1 peak count")
+    ax.fill_between(azimuths, top2_smooth, alpha=0.4, color="coral",
+                    label="Top-2 peak count")
+    ax.set_xlabel("Azimuth (°)")
+    ax.set_ylabel("Frame count")
+    ax.set_title(f"Peak-count histogram over time — {tag}")
+    ax.set_xlim(0, 360)
+    ax.set_xticks(np.arange(0, 361, 45))
+    ax.legend(fontsize=9)
+
+    # Mark detected tracks
+    if scene is not None:
+        for cand in scene.get("candidates", []):
+            az = cand["mean_azimuth"]
+            ax.axvline(az, color="red", alpha=0.5, linewidth=1.0,
+                       linestyle="--")
+        for prov in scene.get("provisional_candidates", []):
+            az = prov["mean_azimuth"]
+            ax.axvline(az, color="gray", alpha=0.4, linewidth=0.8,
+                       linestyle=":")
+
+    save_path = DOA_DIR / f"{tag}_plot_peak_histogram.png"
+    save_figure(fig, save_path)
+    logger.info("[%s][viz] saved %s", tag, save_path.name)
+
+
+def plot_window_max_spectrum(
+    posteriors: np.ndarray,
+    scene: Optional[dict],
+    tag: str,
+    window_dur_s: float = 1.5,
+) -> None:
+    """
+    Window-max angular spectrum: for each angle, the maximum of
+    windowed time-averages.
+
+    Unlike the global mean spectrum (blue line), this preserves
+    evidence for late-starting or intermittent speakers whose best
+    window is strong but whose global average is diluted.
+
+    Saves to ``outputs/doa/{tag}_plot_window_max_spectrum.png``.
+    """
+    n_grid, n_frames = posteriors.shape
+    hop = get_stft_params().get("hop_length", 256)
+    win_frames = max(1, int(window_dur_s * SAMPLE_RATE / hop))
+    step = max(1, win_frames // 2)
+
+    window_max = np.zeros(n_grid, dtype=np.float64)
+    t = 0
+    while t + win_frames <= n_frames:
+        win_avg = posteriors[:, t:t + win_frames].mean(axis=1)
+        window_max = np.maximum(window_max, win_avg)
+        t += step
+
+    # Also compute the global mean for comparison
+    global_avg = posteriors.mean(axis=1)
+
+    azimuths = np.arange(n_grid)
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(azimuths, global_avg, linewidth=1.2, color="steelblue",
+            alpha=0.6, label="Global mean (blue line)")
+    ax.plot(azimuths, window_max, linewidth=1.4, color="darkorange",
+            label=f"Window-max ({window_dur_s:.1f}s)")
+    ax.set_xlabel("Azimuth (°)")
+    ax.set_ylabel("Posterior strength")
+    ax.set_title(f"Window-max vs global-mean spectrum — {tag}")
+    ax.set_xlim(0, 360)
+    ax.set_xticks(np.arange(0, 361, 45))
+    ax.legend(fontsize=9)
+
+    # Mark detected tracks
+    if scene is not None:
+        for cand in scene.get("candidates", []):
+            az = cand["mean_azimuth"]
+            ax.axvline(az, color="red", alpha=0.5, linewidth=1.0,
+                       linestyle="--")
+        for prov in scene.get("provisional_candidates", []):
+            az = prov["mean_azimuth"]
+            ax.axvline(az, color="gray", alpha=0.4, linewidth=0.8,
+                       linestyle=":")
+
+    save_path = DOA_DIR / f"{tag}_plot_window_max_spectrum.png"
     save_figure(fig, save_path)
     logger.info("[%s][viz] saved %s", tag, save_path.name)
 
@@ -239,6 +402,7 @@ def plot_polar_tracks(
     ax.set_theta_direction(-1)
 
     colors = plt.cm.tab10.colors
+    # Confirmed (solid, inner ring)
     for i, cand in enumerate(candidates):
         az_rad = np.deg2rad(cand["mean_azimuth"])
         c = colors[i % len(colors)]
@@ -247,10 +411,21 @@ def plot_polar_tracks(
             f"  {cand.get('id', '')} ({cand['mean_azimuth']:.0f}°)",
             xy=(az_rad, 1.0), fontsize=8, color=c,
         )
+    # Provisional (hollow, outer ring)
+    provisionals = scene.get("provisional_candidates", [])
+    for j, prov in enumerate(provisionals):
+        az_rad = np.deg2rad(prov["mean_azimuth"])
+        c = colors[(len(candidates) + j) % len(colors)]
+        ax.plot(az_rad, 1.15, 'o', color=c, markersize=9,
+                markerfacecolor='none', markeredgewidth=1.5)
+        ax.annotate(
+            f"  prov ({prov['mean_azimuth']:.0f}°)",
+            xy=(az_rad, 1.15), fontsize=7, color=c, alpha=0.7,
+        )
 
-    ax.set_ylim(0, 1.3)
+    ax.set_ylim(0, 1.4)
     ax.set_yticks([])
-    ax.set_title(f"Speaker directions — {tag}", pad=20)
+    ax.set_title(f"Speaker directions — {tag}  ({len(candidates)}C + {len(provisionals)}P)", pad=20)
 
     save_path = DOA_DIR / f"{tag}_plot_polar_tracks.png"
     save_figure(fig, save_path)
@@ -345,6 +520,14 @@ def main(tag: str = "mixture") -> None:
         plot_avg_spectrum(posteriors, scene, tag)
     else:
         logger.warning("[%s][viz] skipping avg spectrum — no posteriors", tag)
+
+    # 2b. Peak-count histogram (intermittent speaker diagnostic)
+    if posteriors is not None:
+        plot_peak_count_histogram(posteriors, scene, tag)
+
+    # 2c. Window-max spectrum (late/bursty speaker diagnostic)
+    if posteriors is not None:
+        plot_window_max_spectrum(posteriors, scene, tag)
 
     # 3. Polar plot
     if scene is not None:

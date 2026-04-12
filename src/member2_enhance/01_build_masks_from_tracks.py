@@ -318,6 +318,21 @@ def main() -> None:
     with open(tracks_path, "r", encoding="utf-8") as fh:
         scene = json.load(fh)
     candidates = scene.get("candidates", [])
+
+    # ── Optionally include provisional candidates ──────────────────
+    if enh_cfg.get("include_provisionals", False):
+        min_score = float(enh_cfg.get("provisional_min_score", 0.75))
+        min_dur = float(enh_cfg.get("provisional_min_duration_s", 5.0))
+        provs = scene.get("provisional_candidates", [])
+        accepted = [p for p in provs
+                    if p.get("mean_score", 0) >= min_score
+                    and p.get("total_duration_s", 0) >= min_dur]
+        if accepted:
+            logger.info("[member2][mask] including %d/%d provisionals "
+                        "(score>=%.2f, dur>=%.1fs)",
+                        len(accepted), len(provs), min_score, min_dur)
+            candidates = candidates + accepted
+
     logger.info("[member2][mask] %d candidate(s)", len(candidates))
 
     post_path = DOA_DIR / "doa_posteriors.npy"
@@ -354,15 +369,46 @@ def main() -> None:
                            "— falling back to broadband")
             use_subband = False
 
+    # ── Adaptive per-candidate sigma ───────────────────────────────────
+    mean_azimuths = []
+    for cand in candidates:
+        az_tmp = _get_azimuth_per_frame(cand, n_frames)
+        valid = az_tmp[~np.isnan(az_tmp)]
+        if len(valid) > 0:
+            # Circular mean to handle wrap-around at 0°/360°
+            rad = np.deg2rad(valid)
+            mean_az = float(np.rad2deg(np.arctan2(
+                np.mean(np.sin(rad)), np.mean(np.cos(rad))))) % 360.0
+        else:
+            mean_az = 0.0
+        mean_azimuths.append(mean_az)
+
+    per_cand_sigma = []
+    min_sigma_floor = 3.0
+    for i, az_i in enumerate(mean_azimuths):
+        min_gap = 360.0
+        for j, az_j in enumerate(mean_azimuths):
+            if i == j:
+                continue
+            gap = abs((az_i - az_j + 180) % 360 - 180)
+            min_gap = min(min_gap, gap)
+        cand_sig = max(min_sigma_floor, min(sigma_deg, min_gap / 2.0))
+        per_cand_sigma.append(cand_sig)
+
+    logger.info("[member2][mask] adaptive sigma: %s",
+                ", ".join(f"{c.get('id','?')}={s:.1f}°"
+                          for c, s in zip(candidates, per_cand_sigma)))
+
     # ── Phase 1: per-candidate masks ───────────────────────────────────
     all_raw_masks = []
     all_time_scores = []
     all_active = []
     cids = []
 
-    for cand in candidates:
+    for idx, cand in enumerate(candidates):
         cid = cand.get("id", "spk00")
         cids.append(cid)
+        cand_sigma = per_cand_sigma[idx]
 
         active = _build_active_frame_mask(cand, n_frames, hop, sr)
         az = _get_azimuth_per_frame(cand, n_frames)
@@ -370,6 +416,8 @@ def main() -> None:
 
         if use_subband and calibration is not None:
             # — Narrowband path: per-frequency SRP alignment —
+            # Subband SRP steers physically via calibrated delays;
+            # no broadband angular gate needed.
             mask_2d = _compute_narrowband_doa_score(
                 stft, az, active, calibration, channel_order,
                 n_fft, sr, pair_weights, smooth_bins=subband_smooth,
@@ -380,7 +428,7 @@ def main() -> None:
         else:
             # — Broadband fallback: tile time-only score to all freqs —
             time_score = _compute_raw_time_score(
-                az, active, posteriors, sigma_deg, time_sigma,
+                az, active, posteriors, cand_sigma, time_sigma,
             )
             all_raw_masks.append(
                 np.tile(time_score[np.newaxis, :], (n_freq, 1))
@@ -389,9 +437,9 @@ def main() -> None:
         all_time_scores.append(time_score)
         all_active.append(active)
         n_active = int(active.sum())
-        logger.info("[member2][mask] %s: active=%d  mean=%.4f  max=%.4f"
-                    "  mode=%s",
-                    cid, n_active,
+        logger.info("[member2][mask] %s (σ=%.1f°): active=%d  mean=%.4f  "
+                    "max=%.4f  mode=%s",
+                    cid, cand_sigma, n_active,
                     float(time_score.mean()), float(time_score.max()),
                     "subband" if use_subband else "broadband")
 

@@ -16,8 +16,38 @@ import sys
 import traceback
 
 from src.common.logging_utils import setup_logging
+from src.common.paths import ANALYSIS_DIR
 
 logger = setup_logging("member3_analysis.run_all")
+
+
+def _print_transcripts() -> None:
+    """Print all transcripts and pitch results after analysis."""
+    tx_files = sorted(ANALYSIS_DIR.glob("*_transcript.txt"))
+    if not tx_files:
+        return
+
+    logger.info("─" * 60)
+    logger.info("Transcripts")
+    logger.info("─" * 60)
+    for tx in tx_files:
+        cid = tx.stem.replace("_transcript", "")
+        text = tx.read_text(encoding="utf-8").strip()
+        logger.info("  [%s] %s", cid, text)
+
+    # Also print pitch summary if available
+    import json
+    pitch_path = ANALYSIS_DIR / "pitch_results.json"
+    if pitch_path.exists():
+        logger.info("─" * 60)
+        logger.info("Pitch summary")
+        logger.info("─" * 60)
+        with open(pitch_path, "r", encoding="utf-8") as fh:
+            for item in json.load(fh):
+                logger.info("  [%s] F0=%.1f Hz  %s",
+                            item.get("candidate_id", "?"),
+                            item.get("median_f0_hz", 0),
+                            item.get("voice_type", "?"))
 
 
 def main() -> None:
@@ -43,6 +73,8 @@ def main() -> None:
             logger.error("Step '%s' failed: %s", label, exc)
             traceback.print_exc()
             sys.exit(1)
+
+    _print_transcripts()
 
     logger.info("=" * 60)
     logger.info("Member 3 pipeline complete ✓")
