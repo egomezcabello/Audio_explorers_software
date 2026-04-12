@@ -28,11 +28,14 @@ data/*.wav
 data/*.flac
 data/*.mp3
 
-# ── Model weights (DO NOT commit) ───────────────────────────────────────
+# ── Model weights & caches (DO NOT commit) ──────────────────────────────
 models/whisper/*.bin
 models/whisper/*.pt
+models/whisper/models--*/
+models/whisper/CACHEDIR.TAG
 models/speechbrain/*.ckpt
 models/speechbrain/*.pt
+models/speechbrain/speechbrain--*/
 models/optional_separation/*.pt
 models/cache/*
 !models/cache/.gitkeep
@@ -41,11 +44,15 @@ models/cache/*
 outputs/calib/*.json
 outputs/doa/*.npy
 outputs/doa/*.json
+outputs/doa/*.png
 outputs/intermediate/*.npy
+outputs/intermediate/*.npz
 outputs/separated/*.wav
 outputs/separated/*.npz
+outputs/separated/*.npy
 outputs/analysis/*.json
 outputs/analysis/*.txt
+outputs/analysis/*.npy
 outputs/final/*.wav
 outputs/final/*.json
 outputs/final/figures/*.png
@@ -53,6 +60,9 @@ outputs/report/figures/*.png
 outputs/report/tables/*.csv
 outputs/report/draft/*.pdf
 outputs/report/draft/*.tex
+outputs/doa_tuning/*.csv
+outputs/doa_tuning/*.json
+outputs/member1_sweeps/*
 
 # ── Environment files with secrets ──────────────────────────────────────
 .env
