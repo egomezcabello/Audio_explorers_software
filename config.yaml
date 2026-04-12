@@ -186,22 +186,23 @@ doa:
 # ── Enhancement ────────────────────────────────────────────────────────
 enhancement:
   mvdr_diagonal_loading: 1.0e-6
-  mask_sigma_deg: 6.0
+  mask_sigma_deg: 6.0             # broadband fallback width
   mask_time_smooth_sigma: 0.3
   mask_floor: 0.0
   use_spatial_masks: true
-  mask_exponent: 3.0
+  mask_exponent: 3.0             # spatial selectivity for competitive masking
   include_provisionals: true
   provisional_min_score: 0.65
-  provisional_min_duration_s: 4.0
+  provisional_min_duration_s: 4.0  # include provisionals for null steering coverage
+  provisional_min_sep_deg: 0        # no angular gate — near-confirmed provs useful as nulls
   spatial_pilot_threshold: 0.90
   use_interferer_nulling: true
-  null_steering_strength: 2.5     # base scale factor for spatial null constraints
+  null_steering_strength: 2.5     # moderate nulling — 4 mics cannot null 5 dirs at once
   steering_mode: "doa_model"        # "doa_model" or "eigen"
 
   # Subband masking – per-frequency masks via narrowband SRP alignment
   use_subband_masks: true
-  subband_smooth_bins: 8           # smooth alignment across this many freq bins
+  subband_smooth_bins: 16           # wider freq smoothing — spreads HF front-back contrast to LF
 
   # Segment-wise steering – per-block azimuth adapts to direction changes
   segment_steering: true
@@ -232,7 +233,7 @@ analysis:
   whisper_initial_prompt: null                  # disabled (prompt text can leak into output)
 
   # Pitch / voice-type classification thresholds
-  pitch_male_female_hz: 175       # below → male, above → female
+  pitch_male_female_hz: 165       # below → male, above → female (spk01 ≈ 167 Hz is female)
   pitch_female_child_hz: 260      # above → child
   pitch_mask_floor: 0.3           # ignore frames with mask weight below this
   pitch_percentile: 25            # use P25 instead of median for robustness
@@ -254,6 +255,10 @@ paths:
   data_dir: "data"
   output_dir: "outputs"
   models_dir: "models"
+
+# ── Pipeline options ───────────────────────────────────────────────────
+pipeline:
+  save_debug: false               # save debug/intermediate .npz and raw JSON
 
 # ── Logging ────────────────────────────────────────────────────────────
 logging:

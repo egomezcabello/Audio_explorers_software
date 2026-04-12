@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-05_sweep_tuning.py – Member 1 parameter sweep / tuning utility.
+04_sweep_tuning.py – Member 1 parameter sweep / tuning utility.
 ================================================================
 Runs many Member 1 configurations, evaluates each against example
 ground truth plus mixture sanity checks, and ranks results.
 
 Usage
 -----
-    python -m src.member1_doa.05_sweep_tuning
-    python -m src.member1_doa.05_sweep_tuning --max-runs 100
-    python -m src.member1_doa.05_sweep_tuning --seed 123 --output-name my_sweep
+    python -m src.member1_doa.04_sweep_tuning
+    python -m src.member1_doa.04_sweep_tuning --max-runs 100
+    python -m src.member1_doa.04_sweep_tuning --seed 123 --output-name my_sweep
 
 The script does NOT permanently modify config.yaml.  It mutates the
 in-memory ``CFG`` dict before each run and restores it afterwards.

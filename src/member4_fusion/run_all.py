@@ -39,6 +39,10 @@ def main() -> None:
     logger.info("Member 4 – Fusion pipeline  (4 steps)")
     logger.info("=" * 60)
 
+    # Clean stale final outputs so re-runs start fresh
+    for stale in list(FINAL_DIR.glob("*.json")) + list(FINAL_DIR.glob("*.wav")):
+        stale.unlink()
+
     for label, module_name in steps:
         logger.info("──── %s ────", label)
         try:

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-06_smaller_sweep.py – Focused local parameter sweep around the best M1 config.
+05_smaller_sweep.py – Focused local parameter sweep around the best M1 config.
 ================================================================================
 Samples configurations from a *narrow* neighbourhood around a known-good
 parameter set and evaluates each against example ground truth + mixture
-sanity, exactly like the broad sweep (05_sweep_tuning.py).
+sanity, exactly like the broad sweep (04_sweep_tuning.py).
 
 Differences from the broad sweep
 ---------------------------------
 * **Smaller, centred search space** – each parameter varies only ±1-2
   steps around the current best, not across the full range.
-* **Self-contained** – does not import or modify 05_sweep_tuning.py.
+* **Self-contained** – does not import or modify 04_sweep_tuning.py.
 * **Separate outputs** – results go to ``outputs/member1_sweeps/smaller_sweep/``
   so old broad-sweep outputs are never touched.
 * **Optional best-config export** – ``--write-best-config`` dumps a
@@ -18,9 +18,9 @@ Differences from the broad sweep
 
 Usage
 -----
-    python -m src.member1_doa.06_smaller_sweep
-    python -m src.member1_doa.06_smaller_sweep --runs 80 --seed 99
-    python -m src.member1_doa.06_smaller_sweep --write-best-config
+    python -m src.member1_doa.05_smaller_sweep
+    python -m src.member1_doa.05_smaller_sweep --runs 80 --seed 99
+    python -m src.member1_doa.05_smaller_sweep --write-best-config
 """
 
 from __future__ import annotations

@@ -323,15 +323,75 @@ def main() -> None:
     if enh_cfg.get("include_provisionals", False):
         min_score = float(enh_cfg.get("provisional_min_score", 0.75))
         min_dur = float(enh_cfg.get("provisional_min_duration_s", 5.0))
+        min_sep = float(enh_cfg.get("provisional_min_sep_deg", 0.0))
         provs = scene.get("provisional_candidates", [])
-        accepted = [p for p in provs
-                    if p.get("mean_score", 0) >= min_score
-                    and p.get("total_duration_s", 0) >= min_dur]
+        conf_azs = [c.get("mean_azimuth", 0) for c in candidates]
+        accepted = []
+        for p in provs:
+            if p.get("mean_score", 0) < min_score:
+                continue
+            if p.get("total_duration_s", 0) < min_dur:
+                continue
+            if min_sep > 0 and conf_azs:
+                p_az = p.get("mean_azimuth", 0)
+                too_close = any(
+                    min(abs(p_az - ca), 360 - abs(p_az - ca)) < min_sep
+                    for ca in conf_azs
+                )
+                if too_close:
+                    logger.info("[member2][mask] rejecting %s (%.1f°) — "
+                                "too close to confirmed track",
+                                p.get("id", "?"), p_az)
+                    continue
+            accepted.append(p)
         if accepted:
             logger.info("[member2][mask] including %d/%d provisionals "
-                        "(score>=%.2f, dur>=%.1fs)",
-                        len(accepted), len(provs), min_score, min_dur)
+                        "(score>=%.2f, dur>=%.1fs, sep>=%.0f°)",
+                        len(accepted), len(provs), min_score, min_dur,
+                        min_sep)
             candidates = candidates + accepted
+
+    # ── Early dedup of provisionals via DoA posterior correlation ──
+    # Two provisionals tracking the same real source will have highly
+    # correlated SRP posterior power at their respective azimuths.
+    # Detect and drop the weaker duplicate *before* mask building so
+    # competitive masking sees fewer candidates.
+    dedup_corr_thresh = float(enh_cfg.get("dedup_posterior_corr", 0.95))
+    prov_ids = {p.get("id") for p in scene.get("provisional_candidates", [])}
+    prov_cands = [(i, c) for i, c in enumerate(candidates)
+                  if c.get("id") in prov_ids]
+    # Keep all candidate azimuths before dedup for null steering
+    all_candidates_pre_dedup = list(candidates)
+    if len(prov_cands) >= 2:
+        _post_path = DOA_DIR / "doa_posteriors.npy"
+        if _post_path.exists():
+            _post = np.load(str(_post_path))  # (n_frames_doa, 360)
+            drop_set: set[int] = set()
+            for ai, (idx_a, ca) in enumerate(prov_cands):
+                for idx_b, cb in prov_cands[ai + 1:]:
+                    if idx_a in drop_set or idx_b in drop_set:
+                        continue
+                    az_a = int(round(ca.get("mean_azimuth", 0))) % 360
+                    az_b = int(round(cb.get("mean_azimuth", 0))) % 360
+                    pa = _post[az_a, :]
+                    pb = _post[az_b, :]
+                    corr = float(np.corrcoef(pa, pb)[0, 1])
+                    if corr > dedup_corr_thresh:
+                        # Drop the one with lower mean posterior power
+                        pow_a = float(pa.mean())
+                        pow_b = float(pb.mean())
+                        drop_idx = idx_a if pow_a < pow_b else idx_b
+                        keep_id = ca.get("id") if drop_idx == idx_b else cb.get("id")
+                        drop_id = ca.get("id") if drop_idx == idx_a else cb.get("id")
+                        drop_set.add(drop_idx)
+                        logger.info(
+                            "[member2][mask] early dedup: %s↔%s "
+                            "corr=%.3f > %.2f — dropping %s, keeping %s",
+                            ca.get("id"), cb.get("id"), corr,
+                            dedup_corr_thresh, drop_id, keep_id)
+            if drop_set:
+                candidates = [c for i, c in enumerate(candidates)
+                              if i not in drop_set]
 
     logger.info("[member2][mask] %d candidate(s)", len(candidates))
 
@@ -482,26 +542,43 @@ def main() -> None:
                           for c, m in zip(cids, all_masks)))
 
     # ── Save ───────────────────────────────────────────────────────────
+    # Clean stale masks from previous runs
+    for old in INTERMEDIATE_DIR.glob("*_mask.npy"):
+        stem = old.stem.replace("_mask", "")
+        if stem not in cids:
+            old.unlink()
+            logger.debug("[member2][mask] removed stale %s", old.name)
+
     for cid, mask in zip(cids, all_masks):
         np.save(str(INTERMEDIATE_DIR / f"{cid}_mask.npy"), mask)
 
-    debug_data = dict(
-        candidate_ids=np.array(cids, dtype=object),
-        final_masks=np.stack(all_masks, axis=0),
-        raw_masks=np.stack(all_raw_masks, axis=0).astype(np.float32),
-        active_frame_masks=np.stack(all_active, axis=0),
-        time_scores=np.stack(
-            [s.astype(np.float32) for s in all_time_scores], axis=0),
-    )
-    if use_spatial and all_spatial_w[0] is not None:
-        debug_data["spatial_weights"] = np.stack(
-            all_spatial_w, axis=0).astype(np.float32)
+    # Save active-candidate manifest for downstream steps
+    manifest = [c.get("id") for c in candidates]
+    # Also save ALL candidate azimuths (including deduped provisionals)
+    # so step 02 can use them as null-steering directions.
+    all_null_azs = {c.get("id"): float(c.get("mean_azimuth", 0))
+                    for c in all_candidates_pre_dedup}
+    with open(INTERMEDIATE_DIR / "active_candidates.json", "w") as fh:
+        json.dump({"active": manifest, "null_azimuths": all_null_azs}, fh)
 
-    np.savez_compressed(
-        str(INTERMEDIATE_DIR / "masks_debug.npz"), **debug_data)
+    save_debug = CFG.get("pipeline", {}).get("save_debug", False)
+    if save_debug:
+        debug_data = dict(
+            candidate_ids=np.array(cids, dtype=object),
+            final_masks=np.stack(all_masks, axis=0),
+            raw_masks=np.stack(all_raw_masks, axis=0).astype(np.float32),
+            active_frame_masks=np.stack(all_active, axis=0),
+            time_scores=np.stack(
+                [s.astype(np.float32) for s in all_time_scores], axis=0),
+        )
+        if use_spatial and all_spatial_w[0] is not None:
+            debug_data["spatial_weights"] = np.stack(
+                all_spatial_w, axis=0).astype(np.float32)
 
-    logger.info("[member2][mask] saved %d mask(s) + masks_debug.npz",
-                len(all_masks))
+        np.savez_compressed(
+            str(INTERMEDIATE_DIR / "masks_debug.npz"), **debug_data)
+
+    logger.info("[member2][mask] saved %d mask(s)", len(all_masks))
 
 
 if __name__ == "__main__":

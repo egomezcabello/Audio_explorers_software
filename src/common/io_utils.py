@@ -14,7 +14,7 @@ from typing import Tuple
 import numpy as np
 import soundfile as sf
 
-from src.common.constants import CHANNEL_ORDER, N_CHANNELS, SAMPLE_RATE
+from src.common.constants import N_CHANNELS, SAMPLE_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -104,8 +104,3 @@ def save_mono_wav(
     path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(path), audio, sr)
     logger.info("Saved %s (%.2f s)", path.name, len(audio) / sr)
-
-
-def channel_label(index: int) -> str:
-    """Return the human-readable label for a channel index (0-based)."""
-    return CHANNEL_ORDER[index]

@@ -168,6 +168,12 @@ def main() -> None:
     """Entry point for step 03 (post-filter & export)."""
     ensure_output_dirs()
 
+    # ── Clean stale outputs from previous runs ──────────────────────────
+    for stale in list(SEPARATED_DIR.glob("*_enhanced.wav")) + \
+                 list(SEPARATED_DIR.glob("*_debug.npz")):
+        stale.unlink()
+    logger.info("[member2][export] cleaned stale WAV/debug files in %s", SEPARATED_DIR)
+
     enh_cfg = CFG.get("enhancement", {})
     postfilter = enh_cfg.get("postfilter", "none")
     use_mask_gate = enh_cfg.get("use_spatial_mask_gate", False)
@@ -189,14 +195,39 @@ def main() -> None:
     if enh_cfg2.get("include_provisionals", False):
         min_score = float(enh_cfg2.get("provisional_min_score", 0.75))
         min_dur = float(enh_cfg2.get("provisional_min_duration_s", 5.0))
+        min_sep = float(enh_cfg2.get("provisional_min_sep_deg", 0.0))
         provs = scene.get("provisional_candidates", [])
-        accepted = [p for p in provs
-                    if p.get("mean_score", 0) >= min_score
-                    and p.get("total_duration_s", 0) >= min_dur]
+        conf_azs = [c.get("mean_azimuth", 0) for c in candidates]
+        accepted = []
+        for p in provs:
+            if p.get("mean_score", 0) < min_score:
+                continue
+            if p.get("total_duration_s", 0) < min_dur:
+                continue
+            if min_sep > 0 and conf_azs:
+                p_az = p.get("mean_azimuth", 0)
+                too_close = any(
+                    min(abs(p_az - ca), 360 - abs(p_az - ca)) < min_sep
+                    for ca in conf_azs
+                )
+                if too_close:
+                    continue
+            accepted.append(p)
         if accepted:
             logger.info("[member2][export] including %d/%d provisionals",
                         len(accepted), len(provs))
             candidates = candidates + accepted
+
+    # ── Honour step-01 dedup manifest if available ──────────────────
+    manifest_path = INTERMEDIATE_DIR / "active_candidates.json"
+    if manifest_path.exists():
+        with open(manifest_path, "r") as _mf:
+            manifest = json.load(_mf)
+        if isinstance(manifest, dict):
+            active_ids = set(manifest.get("active", []))
+        else:
+            active_ids = set(manifest)
+        candidates = [c for c in candidates if c.get("id") in active_ids]
 
     if not candidates:
         logger.warning("[member2][export] no candidates — nothing to export.")
@@ -251,16 +282,18 @@ def main() -> None:
         wav_path = SEPARATED_DIR / f"{cid}_enhanced.wav"
         save_mono_wav(wav_path, audio, sr=SAMPLE_RATE)
 
-        # Update debug file with final outputs
-        debug_path = SEPARATED_DIR / f"{cid}_debug.npz"
-        debug_data = {}
-        if debug_path.exists():
-            with np.load(str(debug_path), allow_pickle=True) as d:
-                debug_data = dict(d)
-        debug_data["filtered_stft"] = filtered
-        debug_data["waveform"] = audio
-        debug_data["postfilter_method"] = np.array(postfilter)
-        np.savez_compressed(str(debug_path), **debug_data)
+        # Update debug file with final outputs (gated)
+        save_debug = CFG.get("pipeline", {}).get("save_debug", False)
+        if save_debug:
+            debug_path = SEPARATED_DIR / f"{cid}_debug.npz"
+            debug_data = {}
+            if debug_path.exists():
+                with np.load(str(debug_path), allow_pickle=True) as d:
+                    debug_data = dict(d)
+            debug_data["filtered_stft"] = filtered
+            debug_data["waveform"] = audio
+            debug_data["postfilter_method"] = np.array(postfilter)
+            np.savez_compressed(str(debug_path), **debug_data)
 
         dur_s = len(audio) / SAMPLE_RATE
         logger.info("[member2][export] %s: %.2fs  peak=%.3f  → %s",

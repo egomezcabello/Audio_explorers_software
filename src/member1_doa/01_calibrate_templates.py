@@ -918,11 +918,6 @@ def main(tag: str = "example") -> None:
     with open(canonical_path, "w", encoding="utf-8") as fh:
         json.dump(bundle, fh, indent=2)
 
-    # Also save a tag-specific copy
-    tag_path = CALIB_DIR / f"{tag}_calibration.json"
-    with open(tag_path, "w", encoding="utf-8") as fh:
-        json.dump(bundle, fh, indent=2)
-
     logger.info("[%s][calib] saved -> %s  (%d dirs, %d pairs)",
                 tag, canonical_path,
                 len(bundle["templates"]), len(ALL_MIC_PAIRS))

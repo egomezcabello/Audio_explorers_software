@@ -753,45 +753,15 @@ def main(tag: str = "mixture") -> None:
     tag_path = DOA_DIR / f"{tag}_doa_posteriors.npy"
     np.save(str(tag_path), P_norm)
 
-    # Raw SRP (optional debug file)
-    srp_path = DOA_DIR / f"{tag}_doa_posteriors_srp.npy"
-    np.save(str(srp_path), P_srp)
-
     # SRP-norm (per-frame normalised SRP — used for dual-map discovery)
     srp_norm_path = DOA_DIR / f"{tag}_doa_posteriors_srp_norm.npy"
     np.save(str(srp_norm_path), P_srp_norm)
-
-    # Hybrid with explicit name (same as canonical, for dual-map scoring)
-    hybrid_path = DOA_DIR / f"{tag}_doa_posteriors_hybrid.npy"
-    np.save(str(hybrid_path), P_norm)
 
     if tag == "mixture":
         canonical_path = DOA_DIR / "doa_posteriors.npy"
         np.save(str(canonical_path), P_norm)
 
-    logger.info("[%s][doa] saved -> %s  (+ srp, srp_norm, hybrid)", tag, tag_path)
-
-    # ── Debug posteriors with preserved dynamic range ─────────────────
-    # These give the tracker a better observation space for direction
-    # discovery: the per-frame max-normalized maps compress amplitude
-    # dynamics, which systematically hides intermittent/weak speakers.
-    eps = 1e-10
-
-    # Log-scale SRP (preserves dynamic range)
-    P_srp_log = np.log(np.maximum(P_srp, eps))
-    np.save(str(DOA_DIR / f"{tag}_doa_posteriors_srp_log.npy"), P_srp_log)
-
-    # Frame-wise z-score (mean=0, std=1 per frame); highlights outlier
-    # directions without collapsing absolute energy differences
-    frame_mean = P_srp.mean(axis=0, keepdims=True)
-    frame_std = P_srp.std(axis=0, keepdims=True)
-    frame_std = np.where(frame_std > eps, frame_std, 1.0)
-    P_srp_zscore = (P_srp - frame_mean) / frame_std
-    np.save(str(DOA_DIR / f"{tag}_doa_posteriors_srp_zscore.npy"),
-            P_srp_zscore)
-
-    logger.info("[%s][doa] saved debug posteriors (srp_log, srp_zscore)",
-                tag)
+    logger.info("[%s][doa] saved -> %s  (+ srp_norm)", tag, tag_path)
 
     # ── Per-group SRP maps ────────────────────────────────────────────
     base_weights = get_pair_weights()

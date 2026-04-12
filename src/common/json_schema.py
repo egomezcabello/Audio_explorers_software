@@ -19,35 +19,6 @@ from typing import Any, Dict, List, Optional
 from src.common.constants import CHANNEL_ORDER, SAMPLE_RATE
 
 
-# ── Shared schema description (for documentation / comments) ───────────
-SCENE_SCHEMA_DOC: str = """
-Shared JSON schema for the inter-member data contract:
-
-{
-  "sample_rate": 44100,
-  "channel_order": ["LF", "LR", "RF", "RR"],
-  "stft_params": {
-      "n_fft": 1024,
-      "hop_length": 256,
-      "win_length": 1024,
-      "window": "hann"
-  },
-  "candidates": [
-    {
-      "id": "spk00",
-      "doa_track": [[frame_idx, azimuth_deg], ...],
-      "active_segments": [[start_s, end_s], ...],
-      "outputs": {
-        "enhanced_wav": "outputs/separated/spk00_enhanced.wav",
-        "analysis_json": "outputs/analysis/spk00_analysis.json",
-        "transcript_txt": "outputs/analysis/spk00_transcript.txt"
-      }
-    }
-  ]
-}
-"""
-
-
 # ── Dataclass representations ──────────────────────────────────────────
 @dataclass
 class CandidateOutputs:

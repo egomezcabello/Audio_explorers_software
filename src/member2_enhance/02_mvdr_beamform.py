@@ -335,14 +335,46 @@ def main() -> None:
     if enh_cfg.get("include_provisionals", False):
         min_score = float(enh_cfg.get("provisional_min_score", 0.75))
         min_dur = float(enh_cfg.get("provisional_min_duration_s", 5.0))
+        min_sep = float(enh_cfg.get("provisional_min_sep_deg", 0.0))
         provs = scene.get("provisional_candidates", [])
-        accepted = [p for p in provs
-                    if p.get("mean_score", 0) >= min_score
-                    and p.get("total_duration_s", 0) >= min_dur]
+        conf_azs = [c.get("mean_azimuth", 0) for c in candidates]
+        accepted = []
+        for p in provs:
+            if p.get("mean_score", 0) < min_score:
+                continue
+            if p.get("total_duration_s", 0) < min_dur:
+                continue
+            if min_sep > 0 and conf_azs:
+                p_az = p.get("mean_azimuth", 0)
+                too_close = any(
+                    min(abs(p_az - ca), 360 - abs(p_az - ca)) < min_sep
+                    for ca in conf_azs
+                )
+                if too_close:
+                    continue
+            accepted.append(p)
         if accepted:
             logger.info("[member2][mvdr] including %d/%d provisionals",
                         len(accepted), len(provs))
             candidates = candidates + accepted
+
+    # ── Honour step-01 dedup manifest if available ──────────────────
+    # The manifest contains:
+    #   "active"       – candidates to beamform (after dedup)
+    #   "null_azimuths" – ALL candidate azimuths (incl. deduped/sidelobe
+    #                     provisionals) for null-steering coverage.
+    null_azimuth_pool: dict[str, float] = {}  # id → azimuth
+    manifest_path = INTERMEDIATE_DIR / "active_candidates.json"
+    if manifest_path.exists():
+        with open(manifest_path, "r") as _mf:
+            manifest = json.load(_mf)
+        if isinstance(manifest, dict):
+            active_ids = set(manifest.get("active", []))
+            null_azimuth_pool = manifest.get("null_azimuths", {})
+        else:
+            # Legacy: plain list
+            active_ids = set(manifest)
+        candidates = [c for c in candidates if c.get("id") in active_ids]
 
     if not candidates:
         logger.warning("[member2][mvdr] no candidates — nothing to do.")
@@ -485,22 +517,24 @@ def main() -> None:
         out_path = SEPARATED_DIR / f"{cid}_enhanced_stft.npy"
         np.save(str(out_path), enhanced)
 
-        # Save debug NPZ
-        debug = dict(
-            steering_mode=np.array(actual_mode),
-            mean_azimuth=np.array(mean_az),
-            mask=mask.astype(np.float32),
-            steer=steer,
-            weights=weights,
-            cov_target=cov_target,
-            cov_noise=cov_noise,
-            mix_power=np.array(mix_power),
-            enh_power=np.array(enh_power),
-        )
-        if mic_delays is not None:
-            debug["relative_mic_delays"] = mic_delays
-        np.savez_compressed(
-            str(SEPARATED_DIR / f"{cid}_debug.npz"), **debug)
+        # Save debug NPZ (gated)
+        save_debug = CFG.get("pipeline", {}).get("save_debug", False)
+        if save_debug:
+            debug = dict(
+                steering_mode=np.array(actual_mode),
+                mean_azimuth=np.array(mean_az),
+                mask=mask.astype(np.float32),
+                steer=steer,
+                weights=weights,
+                cov_target=cov_target,
+                cov_noise=cov_noise,
+                mix_power=np.array(mix_power),
+                enh_power=np.array(enh_power),
+            )
+            if mic_delays is not None:
+                debug["relative_mic_delays"] = mic_delays
+            np.savez_compressed(
+                str(SEPARATED_DIR / f"{cid}_debug.npz"), **debug)
 
         if actual_mode == "doa_model_segment":
             logger.info("[member2][mvdr] %s: steering=%s  az=%.1f  "

@@ -99,7 +99,7 @@ def transcribe(
             has_cuda = False
 
         device = "cuda" if has_cuda else "cpu"
-        compute_type = "float16" if has_cuda else "float32"
+        compute_type = "float16" if has_cuda else "int8"
         logger.info("Loading Whisper model '%s' (device=%s, compute=%s)",
                      model_size, device, compute_type)
         _whisper_model_cache["model"] = WhisperModel(

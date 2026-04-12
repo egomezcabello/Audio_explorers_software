@@ -74,3 +74,6 @@ outputs/member1_sweeps/*
 .pytest_cache/
 htmlcov/
 .coverage
+outputs/doa_tuning/*.png
+outputs/intermediate/*.json
+outputs/sweep_calibration/*

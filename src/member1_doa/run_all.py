@@ -3,12 +3,15 @@
 run_all.py – Execute the complete Member 1 (DoA) pipeline.
 ===========================================================
 
-Runs steps 00 → 01 → 02 → 03 sequentially:
+Runs steps 00 → 01 → 02 → 03 → 06 sequentially:
 
   00  Load & STFT       — for **all** WAVs
   01  Calibrate         — on ``example_mixture.wav`` **only**
   02  DoA estimate      — per tag (uses calibration from step 01)
   03  Track & cluster   — per tag
+  06  Visualize         — per tag
+
+Sweep / tuning scripts (04, 05) are run separately.
 
 If any step fails, the pipeline stops and reports the error.
 
@@ -60,7 +63,7 @@ def main() -> None:
 
     if args.sweep:
         import importlib, sys
-        mod = importlib.import_module("src.member1_doa.05_sweep_tuning")
+        mod = importlib.import_module("src.member1_doa.04_sweep_tuning")
         logger.info("Delegating to sweep / tuning script ...")
         sys.argv = [sys.argv[0]]  # reset argv so sweep's argparse works
         mod.main()
@@ -92,7 +95,7 @@ def main() -> None:
     if calib_tag not in tags:
         tags = [calib_tag] + tags
 
-    # ── Steps 02–04 for each tag ─────────────────────────────────────
+    # ── Steps 02–03, 06 for each tag ─────────────────────────────────────
     for tag in tags:
         logger.info("═" * 60)
         logger.info("Processing tag: %s", tag)
@@ -101,8 +104,8 @@ def main() -> None:
                   tag=tag)
         _run_step("03  Track & cluster", "src.member1_doa.03_track_and_cluster",
                   tag=tag)
-        _run_step("04  Visualize results",
-                  "src.member1_doa.04_visualize_results", tag=tag)
+        _run_step("06  Visualize results",
+                  "src.member1_doa.06_visualize_results", tag=tag)
 
     logger.info("=" * 60)
     logger.info("Member 1 pipeline complete  (%d input(s))", len(tags))

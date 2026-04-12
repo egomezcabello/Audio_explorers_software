@@ -70,9 +70,13 @@ def _bigram_overlap(t1: str, t2: str) -> float:
 
 def _deduplicate(
     candidates: List[Dict[str, Any]],
-    threshold: float = 0.5,
+    threshold: float = 0.30,
 ) -> List[Dict[str, Any]]:
-    """Group candidates with similar transcripts; keep best per group."""
+    """Group candidates with similar transcripts; keep best per group.
+
+    A Jaccard / bigram threshold of 0.30 catches near-duplicate sources
+    even when ASR produces slightly different wording from each angle.
+    """
     n = len(candidates)
     if n <= 1:
         return candidates
@@ -158,10 +162,26 @@ def merge_candidates() -> SceneSummary:
     if enh_cfg.get("include_provisionals", False):
         min_score = float(enh_cfg.get("provisional_min_score", 0.75))
         min_dur = float(enh_cfg.get("provisional_min_duration_s", 5.0))
+        min_sep = float(enh_cfg.get("provisional_min_sep_deg", 0.0))
         provs = raw.get("provisional_candidates", [])
-        accepted = [p for p in provs
-                    if p.get("mean_score", 0) >= min_score
-                    and p.get("total_duration_s", 0) >= min_dur]
+        conf_azs = [c.get("mean_azimuth", 0) for c in all_candidates]
+        accepted = []
+        for p in provs:
+            if p.get("mean_score", 0) < min_score:
+                continue
+            if p.get("total_duration_s", 0) < min_dur:
+                continue
+            if min_sep > 0 and conf_azs:
+                p_az = p.get("mean_azimuth", 0)
+                too_close = any(
+                    min(abs(p_az - ca), 360 - abs(p_az - ca)) < min_sep
+                    for ca in conf_azs
+                )
+                if too_close:
+                    logger.info("Provisional %s rejected (too close to confirmed)",
+                                p.get("id"))
+                    continue
+            accepted.append(p)
         if accepted:
             logger.info("Including %d/%d provisionals", len(accepted), len(provs))
             all_candidates.extend(accepted)
@@ -169,7 +189,7 @@ def merge_candidates() -> SceneSummary:
     logger.info("Total candidates before dedup: %d", len(all_candidates))
 
     # ── Deduplicate by transcript similarity ───────────────────────────
-    deduped = _deduplicate(all_candidates, threshold=0.5)
+    deduped = _deduplicate(all_candidates)
     logger.info("After deduplication: %d candidates", len(deduped))
 
     # ── Build SceneSummary ─────────────────────────────────────────────

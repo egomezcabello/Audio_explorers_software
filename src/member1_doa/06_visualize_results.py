@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-04_visualize_results.py – Visualize Member 1 DoA results.
+06_visualize_results.py – Visualize Member 1 DoA results.
 ==========================================================
 Final step of the Member 1 (DoA) pipeline.
 
@@ -15,9 +15,9 @@ Also prints concise summaries to the logger.
 
 Usage
 -----
-    python -m src.member1_doa.04_visualize_results --tag example
-    python -m src.member1_doa.04_visualize_results --tag mixture
-    python -m src.member1_doa.04_visualize_results --tag all
+    python -m src.member1_doa.06_visualize_results --tag example
+    python -m src.member1_doa.06_visualize_results --tag mixture
+    python -m src.member1_doa.06_visualize_results --tag all
 """
 
 from __future__ import annotations

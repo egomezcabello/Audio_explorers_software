@@ -21,6 +21,29 @@ from src.common.paths import ANALYSIS_DIR
 logger = setup_logging("member3_analysis.run_all")
 
 
+def _clean_stale_analysis() -> None:
+    """Remove per-candidate analysis artefacts from previous runs.
+
+    This prevents stale results (from candidates that no longer exist)
+    from leaking into downstream steps when M3 is re-run after M2
+    produced a different candidate set.
+    """
+    patterns = ["*_vad.npy", "*_transcript.txt", "*_analysis.json"]
+    removed = 0
+    for pat in patterns:
+        for f in ANALYSIS_DIR.glob(pat):
+            f.unlink()
+            removed += 1
+    # Also clean aggregate files that accumulate entries
+    for agg in ["language_id_results.json", "pitch_results.json"]:
+        p = ANALYSIS_DIR / agg
+        if p.exists():
+            p.unlink()
+            removed += 1
+    if removed:
+        logger.info("Cleaned %d stale analysis file(s)", removed)
+
+
 def _print_transcripts() -> None:
     """Print all transcripts and pitch results after analysis."""
     tx_files = sorted(ANALYSIS_DIR.glob("*_transcript.txt"))
@@ -63,6 +86,8 @@ def main() -> None:
     logger.info("=" * 60)
     logger.info("Member 3 – Analysis pipeline  (5 steps)")
     logger.info("=" * 60)
+
+    _clean_stale_analysis()
 
     for label, module_name in steps:
         logger.info("──── %s ────", label)

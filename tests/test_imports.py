@@ -18,7 +18,6 @@ MODULES = [
     "src.common.config",
     "src.common.logging_utils",
     "src.common.io_utils",
-    "src.common.audio_utils",
     "src.common.stft_utils",
     "src.common.json_schema",
     "src.common.plotting",

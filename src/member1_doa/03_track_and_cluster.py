@@ -1635,7 +1635,7 @@ def main(tag: str = "mixture") -> None:
     # ── Load angular power maps from step 02 ──────────────────────────
     if use_dual_map:
         _srp_p = DOA_DIR / f"{tag}_doa_posteriors_srp_norm.npy"
-        _hyb_p = DOA_DIR / f"{tag}_doa_posteriors_hybrid.npy"
+        _hyb_p = DOA_DIR / f"{tag}_doa_posteriors.npy"
         if _srp_p.exists() and _hyb_p.exists():
             P_disc = np.load(str(_srp_p))
             P_score = np.load(str(_hyb_p))
@@ -1923,9 +1923,11 @@ def main(tag: str = "mixture") -> None:
         "n_rejected": len(rejected),
         "tracks": raw_entries,
     }
-    raw_path = DOA_DIR / f"{tag}_doa_tracks_raw.json"
-    with open(raw_path, "w", encoding="utf-8") as fh:
-        json.dump(raw_debug, fh, indent=2)
+    save_debug = CFG.get("pipeline", {}).get("save_debug", False)
+    if save_debug:
+        raw_path = DOA_DIR / f"{tag}_doa_tracks_raw.json"
+        with open(raw_path, "w", encoding="utf-8") as fh:
+            json.dump(raw_debug, fh, indent=2)
 
     # ── Compact summary ─────────────────────────────────────────────────
     all_kept = confirmed + provisional
@@ -2010,8 +2012,7 @@ def main(tag: str = "mixture") -> None:
         with open(canonical_path, "w", encoding="utf-8") as fh:
             json.dump(result, fh, indent=2)
 
-    logger.info("[%s][track] saved → %s  (+ raw: %s)", tag,
-                tag_path.name, raw_path.name)
+    logger.info("[%s][track] saved → %s", tag, tag_path.name)
 
 
 if __name__ == "__main__":
