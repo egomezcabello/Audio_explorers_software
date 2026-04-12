@@ -933,6 +933,109 @@ def filter_tracks(
     return confirmed, provisional, rejected
 
 
+# ── 5c. Conversation-cluster detection ────────────────────────────────
+
+def detect_conversation_clusters(
+    candidates: List[Dict[str, Any]],
+    max_gap_deg: float = 25.0,
+) -> List[Dict[str, Any]]:
+    """
+    Group spatially close candidates into conversation clusters.
+
+    Two candidates belong to the same cluster if they are within
+    ``max_gap_deg`` of each other (single-linkage: A-B within gap and
+    B-C within gap → A, B, C are one cluster).
+
+    Parameters
+    ----------
+    candidates : list of track dicts (confirmed + provisional)
+        Each must have ``"id"`` and ``"mean_azimuth"``.
+    max_gap_deg : float
+        Maximum angular separation (degrees) to link two candidates.
+
+    Returns
+    -------
+    list of cluster dicts, each with:
+        - ``cluster_id`` : str, e.g. "conv_cluster_0"
+        - ``members`` : list of candidate id strings
+        - ``centroid_deg`` : circular mean azimuth of members
+        - ``span_deg`` : max angular distance between any pair in cluster
+        - ``n_members`` : int
+    """
+    if not candidates:
+        return []
+
+    # Extract (id, azimuth) tuples
+    items = []
+    for c in candidates:
+        cid = c.get("id", "?")
+        az = c.get("mean_azimuth", 0.0)
+        items.append((cid, az))
+
+    n = len(items)
+    # Union-Find for single-linkage clustering
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            gap = _angular_distance(items[i][1], items[j][1])
+            if gap <= max_gap_deg:
+                union(i, j)
+
+    # Group by root
+    groups: Dict[int, List[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+
+    clusters: List[Dict[str, Any]] = []
+    cluster_idx = 0
+    for members_idx in sorted(groups.values(),
+                               key=lambda ms: items[ms[0]][1]):
+        member_ids = [items[m][0] for m in members_idx]
+        azimuths = [items[m][1] for m in members_idx]
+
+        # Circular mean
+        rad = np.deg2rad(azimuths)
+        centroid = float(np.rad2deg(np.arctan2(
+            np.mean(np.sin(rad)), np.mean(np.cos(rad))))) % 360.0
+
+        # Span: max pairwise angular distance
+        span = 0.0
+        for i2 in range(len(azimuths)):
+            for j2 in range(i2 + 1, len(azimuths)):
+                span = max(span, _angular_distance(azimuths[i2], azimuths[j2]))
+
+        clusters.append({
+            "cluster_id": f"conv_cluster_{cluster_idx}",
+            "members": member_ids,
+            "centroid_deg": round(centroid, 1),
+            "span_deg": round(span, 1),
+            "n_members": len(member_ids),
+        })
+        cluster_idx += 1
+
+    # Annotate each candidate with its cluster_id
+    id_to_cluster: Dict[str, str] = {}
+    for cl in clusters:
+        for mid in cl["members"]:
+            id_to_cluster[mid] = cl["cluster_id"]
+    for c in candidates:
+        c["conversation_cluster"] = id_to_cluster.get(c.get("id", ""), "")
+
+    return clusters
+
+
 # ── 5b. Residual discovery ────────────────────────────────────────────
 
 def _residual_discovery(
@@ -1508,6 +1611,15 @@ def main(tag: str = "mixture") -> None:
     merge_sep       = float(doa_cfg.get("merge_max_sep_deg", 12.0))
     merge_iou       = float(doa_cfg.get("merge_min_temporal_iou", 0.60))
 
+    # Wide-angle sidelobe merge
+    wide_merge_sep  = float(doa_cfg.get("wide_merge_max_sep_deg", 40.0))
+    wide_merge_iou  = float(doa_cfg.get("wide_merge_min_temporal_iou", 0.50))
+
+    # Provisional cluster consolidation
+    prov_cluster_gap  = float(doa_cfg.get("provisional_cluster_gap_deg", 40.0))
+    prov_cluster_min  = int(doa_cfg.get("provisional_cluster_min_size", 3))
+    prov_cluster_keep = int(doa_cfg.get("provisional_cluster_max_keep", 1))
+
     # Temporal persistence for peak extraction
     persist_win     = int(doa_cfg.get("temporal_persist_window", 5))
     persist_cnt     = int(doa_cfg.get("temporal_persist_count", 3))
@@ -1719,6 +1831,19 @@ def main(tag: str = "mixture") -> None:
             logger.info("[%s] Merged %d → %d tracks (anti-split)",
                         tag, n_pre_merge, len(tracks))
 
+        # ── Step 4f: wide-angle merge (sidelobes & reflections) ───────
+        if wide_merge_sep > merge_sep:
+            n_pre_wide = len(tracks)
+            tracks = merge_tracks_if_close_and_overlapping(
+                tracks,
+                max_sep_deg=wide_merge_sep,
+                min_temporal_iou=wide_merge_iou,
+            )
+            if len(tracks) < n_pre_wide:
+                logger.info("[%s] Wide merge: %d → %d tracks "
+                            "(sidelobe/reflection removal)",
+                            tag, n_pre_wide, len(tracks))
+
         # ── Step 5: smart filtering ───────────────────────────────────
         confirmed, provisional, rejected = filter_tracks(
             tracks, n_frames,
@@ -1734,6 +1859,44 @@ def main(tag: str = "mixture") -> None:
                     "%d rejected (of %d raw)",
                     tag, len(confirmed), len(provisional),
                     len(rejected), n_raw)
+
+    # ── Step 5b: provisional cluster consolidation ────────────────────
+    # When ≥N provisionals chain-link into a single sidelobe fan,
+    # keep only the best one(s) per cluster.
+    if len(provisional) >= prov_cluster_min:
+        prov_clusters = detect_conversation_clusters(
+            provisional, max_gap_deg=prov_cluster_gap)
+        new_prov: List[Dict[str, Any]] = []
+        for cl in prov_clusters:
+            cl_ids = set(cl["members"])
+            cl_tracks = [p for p in provisional if p.get("id") in cl_ids]
+            if len(cl_tracks) >= prov_cluster_min:
+                # Sort by mean_score descending, keep top N
+                cl_tracks.sort(
+                    key=lambda t: t.get("mean_score", 0), reverse=True)
+                kept = cl_tracks[:prov_cluster_keep]
+                dropped = cl_tracks[prov_cluster_keep:]
+                for d in dropped:
+                    d["status"] = "rejected"
+                    d["rejection_reason"] = "prov_cluster_thinned"
+                    rejected.append(d)
+                new_prov.extend(kept)
+                logger.info(
+                    "[%s] Prov cluster %s (%d members): keep %s, "
+                    "drop %s",
+                    tag, cl["cluster_id"], len(cl_tracks),
+                    [t["id"] for t in kept],
+                    [t["id"] for t in dropped])
+            else:
+                new_prov.extend(cl_tracks)
+        if len(new_prov) < len(provisional):
+            logger.info("[%s] Provisional thinning: %d → %d",
+                        tag, len(provisional), len(new_prov))
+            provisional = new_prov
+            # Re-assign stable IDs after thinning
+            provisional.sort(key=lambda t: t["mean_azimuth"])
+            for i, tr in enumerate(provisional):
+                tr["id"] = f"prov{i:02d}"
 
     # ── Raw debug JSON (all tracks with full metrics) ───────────────────
     raw_entries: List[Dict[str, Any]] = []
@@ -1787,6 +1950,18 @@ def main(tag: str = "mixture") -> None:
         logger.info("[%s][track] provisional=%d | az=[%s]",
                     tag, len(provisional), ",".join(prov_az))
 
+    # ── Step 5c: conversation-cluster detection ──────────────────────
+    conv_clusters = detect_conversation_clusters(
+        confirmed + provisional, max_gap_deg=25.0)
+    multi_member = [c for c in conv_clusters if c["n_members"] > 1]
+    if multi_member:
+        for cl in multi_member:
+            logger.info("[%s][cluster] %s: members=%s  centroid=%.1f°  span=%.1f°",
+                        tag, cl["cluster_id"],
+                        cl["members"], cl["centroid_deg"], cl["span_deg"])
+    else:
+        logger.info("[%s][cluster] no multi-member conversation clusters found", tag)
+
     # ── Step 6: example validation ────────────────────────────────────
     if tag == "example" and all_kept:
         _validate_example_tracks(all_kept)
@@ -1802,6 +1977,7 @@ def main(tag: str = "mixture") -> None:
         "n_confirmed": len(confirmed),
         "n_provisional": len(provisional),
         "n_rejected": len(rejected),
+        "conversation_clusters": conv_clusters,
         "tracking_params": {
             "method": "global_direction_assignment",
             "n_global_directions": n_global,

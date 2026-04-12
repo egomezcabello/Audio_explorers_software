@@ -21,6 +21,7 @@ from typing import Optional
 import numpy as np
 
 from src.common.constants import SAMPLE_RATE
+from src.common.config import CFG
 from src.common.logging_utils import setup_logging
 from src.common.paths import ANALYSIS_DIR, INTERMEDIATE_DIR, SEPARATED_DIR, ensure_output_dirs
 
@@ -78,22 +79,21 @@ def estimate_pitch(
         return np.zeros(n_frames, dtype=np.float64)
 
 
-def classify_voice_type(median_f0: float) -> str:
+def classify_voice_type(median_f0: float,
+                        male_female_hz: float = 175.0,
+                        female_child_hz: float = 260.0) -> str:
     """
     Simple heuristic voice-type classification from median F0.
 
     Returns ``"male"`` / ``"female"`` / ``"child"`` / ``"unknown"``.
 
-    TODO
-    ----
-    - Refine thresholds with real data.
-    - Consider using a trained classifier instead.
+    Thresholds are configurable via config.yaml.
     """
     if median_f0 <= 0:
         return "unknown"
-    if median_f0 < 150:
+    if median_f0 < male_female_hz:
         return "male"
-    if median_f0 < 220:
+    if median_f0 < female_child_hz:
         return "female"
     return "child"
 
@@ -101,6 +101,13 @@ def classify_voice_type(median_f0: float) -> str:
 def main() -> None:
     """Entry point for step 03 (pitch)."""
     ensure_output_dirs()
+
+    # Read configurable thresholds
+    analysis_cfg = CFG.get("analysis", {})
+    male_female_hz = float(analysis_cfg.get("pitch_male_female_hz", 175.0))
+    female_child_hz = float(analysis_cfg.get("pitch_female_child_hz", 260.0))
+    mask_floor = float(analysis_cfg.get("pitch_mask_floor", 0.0))
+    pitch_percentile = int(analysis_cfg.get("pitch_percentile", 50))
 
     wav_files = sorted(SEPARATED_DIR.glob("*_enhanced.wav"))
     if not wav_files:
@@ -134,6 +141,11 @@ def main() -> None:
                     np.linspace(0, 1, n_stft),
                     mask_mean,
                 )
+                # C3: Apply mask floor — ignore frames with low mask weight
+                if mask_floor > 0:
+                    low_mask = weights_all < mask_floor
+                    weights_all[low_mask] = 0.0
+
                 weights = weights_all[voiced_idx]
                 logger.debug("  mask-weighted: %d voiced, mask %s",
                              len(voiced), mask.shape)
@@ -142,24 +154,26 @@ def main() -> None:
         if len(voiced) > 0:
             if (weights is not None and len(weights) == len(voiced)
                     and weights.sum() > 1e-12):
-                # Weighted median
+                # C2: Weighted percentile (P25 by default) for robustness
                 order = np.argsort(voiced)
                 sorted_f0 = voiced[order]
                 sorted_w = weights[order]
                 cum_w = np.cumsum(sorted_w)
+                target_frac = pitch_percentile / 100.0
                 pr.median_f0_hz = float(
-                    sorted_f0[np.searchsorted(cum_w, cum_w[-1] / 2.0)])
+                    sorted_f0[np.searchsorted(cum_w, cum_w[-1] * target_frac)])
                 # Weighted std
                 w_mean = float(np.average(voiced, weights=weights))
                 pr.std_f0_hz = float(
                     np.sqrt(np.average((voiced - w_mean) ** 2,
                                        weights=weights)))
             else:
-                pr.median_f0_hz = float(np.median(voiced))
+                pr.median_f0_hz = float(np.percentile(voiced, pitch_percentile))
                 pr.std_f0_hz = float(np.std(voiced))
             pr.min_f0_hz = float(np.min(voiced))
             pr.max_f0_hz = float(np.max(voiced))
-        pr.voice_type = classify_voice_type(pr.median_f0_hz)
+        pr.voice_type = classify_voice_type(
+            pr.median_f0_hz, male_female_hz, female_child_hz)
 
         results.append(pr)
         logger.info("  → median F0=%.1f Hz, type=%s%s",

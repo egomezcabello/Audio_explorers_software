@@ -113,6 +113,17 @@ doa:
   merge_max_sep_deg: 12.0        # max angular separation to consider merge
   merge_min_temporal_iou: 0.60   # min temporal IoU to trigger merge
 
+  # Wide-angle sidelobe / reflection merge – catches sidelobes that
+  # the narrow 12° merge misses (e.g. same source heard at 265° and 280°)
+  wide_merge_max_sep_deg: 40.0
+  wide_merge_min_temporal_iou: 0.50
+
+  # Provisional cluster consolidation — when ≥N provisionals form a
+  # single-linkage cluster (sidelobe fan), keep only the best one.
+  provisional_cluster_gap_deg: 40.0   # max angular gap for chain-linking
+  provisional_cluster_min_size: 3     # min cluster size to trigger thinning
+  provisional_cluster_max_keep: 1     # keep at most N per cluster
+
   # Windowed discovery – catches intermittent speakers the global average misses
   use_windowed_discovery: true
   window_duration_s: 1.5         # window length in seconds
@@ -174,9 +185,6 @@ doa:
 
 # ── Enhancement ────────────────────────────────────────────────────────
 enhancement:
-  use_wpe: false
-  wpe_taps: 10
-  wpe_delay: 3
   mvdr_diagonal_loading: 1.0e-6
   mask_sigma_deg: 6.0
   mask_time_smooth_sigma: 0.3
@@ -184,10 +192,11 @@ enhancement:
   use_spatial_masks: true
   mask_exponent: 3.0
   include_provisionals: true
-  provisional_min_score: 0.75
-  provisional_min_duration_s: 5.0
+  provisional_min_score: 0.65
+  provisional_min_duration_s: 4.0
   spatial_pilot_threshold: 0.90
   use_interferer_nulling: true
+  null_steering_strength: 2.5     # base scale factor for spatial null constraints
   steering_mode: "doa_model"        # "doa_model" or "eigen"
 
   # Subband masking – per-frequency masks via narrowband SRP alignment
@@ -206,6 +215,19 @@ analysis:
   whisper_model: "large-v3"
   language_id_model: "speechbrain/lang-id-voxlingua107-ecapa"
   min_speech_duration_s: 0.3
+
+  # Whisper decoding parameters
+  whisper_beam_size: 5
+  whisper_compression_ratio_threshold: 2.0    # tighter to reject repetition loops
+  whisper_log_prob_threshold: -1.0             # keep default (was too strict at -0.8)
+  whisper_no_speech_threshold: 0.6
+  whisper_initial_prompt: null                  # disabled (prompt text can leak into output)
+
+  # Pitch / voice-type classification thresholds
+  pitch_male_female_hz: 175       # below → male, above → female
+  pitch_female_child_hz: 260      # above → child
+  pitch_mask_floor: 0.3           # ignore frames with mask weight below this
+  pitch_percentile: 25            # use P25 instead of median for robustness
 
 # ── Fusion ─────────────────────────────────────────────────────────────
 fusion:

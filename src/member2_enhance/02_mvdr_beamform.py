@@ -175,6 +175,51 @@ def compute_steering_doa_model(
     return steer, mic_delays
 
 
+# ── Null-steering at known interferer directions ──────────────────────
+
+def _add_null_steering_to_noise_cov(
+    cov_noise: np.ndarray,
+    interferer_azimuths: list,
+    calibration: dict,
+    n_freq: int,
+    n_fft: int,
+    sr: int,
+    channel_order: list,
+    null_strength: float = 1.0,
+) -> np.ndarray:
+    """
+    Augment noise covariance with explicit interferer spatial nulls.
+
+    For each known interferer azimuth, adds the outer product of the
+    calibrated steering vector (scaled by local noise power) to the
+    noise covariance.  This guarantees the MVDR places spatial nulls
+    at those directions.
+
+    R_n' = R_n + sum_i  alpha * P_avg(f) * d_i * d_i^H
+    """
+    n_ch = cov_noise.shape[1]
+    cov_out = cov_noise.copy()
+
+    # Average noise power per frequency band
+    avg_power = np.real(np.trace(cov_noise, axis1=1, axis2=2)) / n_ch
+
+    for interf_az in interferer_azimuths:
+        try:
+            steer, _ = compute_steering_doa_model(
+                interf_az, calibration, n_freq, n_fft, sr, channel_order,
+            )
+        except Exception:
+            continue
+
+        scale = null_strength
+
+        # Vectorised outer product: (n_freq, n_ch, n_ch)
+        outer = np.einsum('fi,fj->fij', steer, steer.conj())
+        cov_out += scale * avg_power[:, None, None] * outer
+
+    return cov_out
+
+
 # ── MVDR beamforming ──────────────────────────────────────────────────
 
 def mvdr_beamform(
@@ -269,6 +314,7 @@ def main() -> None:
     diag_load = float(enh_cfg.get("mvdr_diagonal_loading", 1e-6))
     steering_mode = enh_cfg.get("steering_mode", "doa_model")
     use_interferer_nulling = enh_cfg.get("use_interferer_nulling", False)
+    null_strength = float(enh_cfg.get("null_steering_strength", 1.0))
     segment_steering = enh_cfg.get("segment_steering", False)
     block_frames = int(enh_cfg.get("steering_block_frames", 200))
 
@@ -320,9 +366,7 @@ def main() -> None:
                            "— falling back to eigen")
 
     # ── Load STFT ──────────────────────────────────────────────────────
-    wpe_path = INTERMEDIATE_DIR / "mixture_stft_wpe.npy"
-    raw_path = INTERMEDIATE_DIR / "mixture_stft.npy"
-    stft_path = wpe_path if wpe_path.exists() else raw_path
+    stft_path = INTERMEDIATE_DIR / "mixture_stft.npy"
     stft = np.load(str(stft_path))
     n_ch, n_freq, n_frames = stft.shape
     logger.info("[member2][mvdr] STFT %s from %s", stft.shape, stft_path.name)
@@ -339,6 +383,11 @@ def main() -> None:
         else:
             logger.warning("[member2][mvdr] mask %s missing — all-ones", cid)
             all_masks[cid] = np.ones((n_freq, n_frames), dtype=np.float64)
+
+    if use_interferer_nulling and calibration is not None and len(candidates) > 1:
+        logger.info("[member2][mvdr] null-steering enabled "
+                    "(strength=%.1f, %d interferer dirs per candidate)",
+                    null_strength, len(candidates) - 1)
 
     # ── Per-candidate MVDR ─────────────────────────────────────────────
     for cand in candidates:
@@ -357,6 +406,15 @@ def main() -> None:
         else:
             noise_mask = 1.0 - mask
         cov_noise = estimate_covariance(stft, noise_mask)
+
+        # ── Explicit spatial null-steering ─────────────────────────────
+        if use_interferer_nulling and calibration is not None and len(candidates) > 1:
+            interf_azs = [float(c.get("mean_azimuth", 0))
+                          for c in candidates if c.get("id") != cid]
+            cov_noise = _add_null_steering_to_noise_cov(
+                cov_noise, interf_azs, calibration,
+                n_freq, n_fft, sr, channel_order, null_strength,
+            )
 
         # ── Steering vector ────────────────────────────────────────────
         mic_delays = None

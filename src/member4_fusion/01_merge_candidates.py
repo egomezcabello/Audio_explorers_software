@@ -54,6 +54,20 @@ def _transcript_similarity(t1: str, t2: str) -> float:
     return len(words1 & words2) / len(words1 | words2)
 
 
+def _bigram_overlap(t1: str, t2: str) -> float:
+    """Character-bigram overlap (Dice coefficient) as fallback similarity."""
+    def _bigrams(s: str) -> set:
+        w = s.lower().split()
+        bg = set()
+        for i in range(len(w) - 1):
+            bg.add((w[i], w[i + 1]))
+        return bg
+    b1, b2 = _bigrams(t1), _bigrams(t2)
+    if not b1 or not b2:
+        return 0.0
+    return 2.0 * len(b1 & b2) / (len(b1) + len(b2))
+
+
 def _deduplicate(
     candidates: List[Dict[str, Any]],
     threshold: float = 0.5,
@@ -88,10 +102,13 @@ def _deduplicate(
     for i in range(n):
         for j in range(i + 1, n):
             sim = _transcript_similarity(transcripts[i], transcripts[j])
-            if sim >= threshold:
+            bg_sim = _bigram_overlap(transcripts[i], transcripts[j])
+            effective = max(sim, bg_sim)
+            if effective >= threshold:
                 union(i, j)
-                logger.info("  duplicate: %s ↔ %s (Jaccard=%.2f)",
-                            candidates[i].get("id"), candidates[j].get("id"), sim)
+                logger.info("  duplicate: %s ↔ %s (Jaccard=%.2f, bigram=%.2f)",
+                            candidates[i].get("id"), candidates[j].get("id"),
+                            sim, bg_sim)
 
     # Group by root
     groups: Dict[int, List[int]] = {}

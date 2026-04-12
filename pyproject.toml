@@ -28,7 +28,6 @@ dependencies = [
     "webrtcvad>=2.0.10",
     "faster-whisper>=0.10",
     "speechbrain>=0.5",
-    "nara-wpe>=0.0.9",
     "pyroomacoustics>=0.7",
 ]
 
