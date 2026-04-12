@@ -35,10 +35,60 @@ from src.common.config import CFG
 from src.common.constants import SAMPLE_RATE
 from src.common.io_utils import save_mono_wav
 from src.common.logging_utils import setup_logging
-from src.common.paths import DOA_DIR, SEPARATED_DIR, ensure_output_dirs
+from src.common.paths import DOA_DIR, INTERMEDIATE_DIR, SEPARATED_DIR, ensure_output_dirs
 from src.common.stft_utils import compute_istft
 
 logger = setup_logging(__name__)
+
+
+# ── Spatial mask gating ────────────────────────────────────────────────
+
+def apply_spatial_mask_gate(
+    enhanced_stft: np.ndarray,
+    mask: np.ndarray,
+    floor: float = 0.05,
+    exponent: float = 1.0,
+) -> np.ndarray:
+    """
+    Gate the enhanced STFT using the spatial mask from mask-building.
+
+    T-F bins where the target mask is low (= interferer-dominated)
+    are attenuated.  This suppresses crosstalk frames that the MVDR
+    beamformer cannot reject because the interferer is too close
+    angularly (e.g. 45° apart on a 4-mic BTE array).
+
+    Parameters
+    ----------
+    enhanced_stft : (n_freq, n_frames) complex
+    mask : (n_freq, n_frames_mask) float  — spatial mask [0, 1]
+    floor : float
+        Minimum gain (prevents total zeroing / artefacts).
+    exponent : float
+        Sharpen the gate by raising mask to this power.
+
+    Returns
+    -------
+    gated : (n_freq, n_frames) complex
+    """
+    n_freq, n_frames = enhanced_stft.shape
+    n_freq_m, n_frames_m = mask.shape
+
+    # Align mask to enhanced STFT dimensions if needed
+    if n_frames_m != n_frames:
+        from scipy.ndimage import zoom
+        scale = (n_freq / n_freq_m, n_frames / n_frames_m)
+        mask = zoom(mask, scale, order=1)
+    elif n_freq_m != n_freq:
+        from scipy.ndimage import zoom
+        scale = (n_freq / n_freq_m, 1.0)
+        mask = zoom(mask, scale, order=1)
+
+    gate = np.clip(mask, 0.0, 1.0)
+    if exponent != 1.0:
+        gate = np.power(gate, exponent)
+    gate = np.clip(gate, floor, 1.0)
+
+    return enhanced_stft * gate
 
 
 # ── Post-filter implementations ───────────────────────────────────────
@@ -120,6 +170,9 @@ def main() -> None:
 
     enh_cfg = CFG.get("enhancement", {})
     postfilter = enh_cfg.get("postfilter", "none")
+    use_mask_gate = enh_cfg.get("use_spatial_mask_gate", False)
+    mask_gate_floor = float(enh_cfg.get("mask_gate_floor", 0.05))
+    mask_gate_exponent = float(enh_cfg.get("mask_gate_exponent", 1.0))
 
     # ── Load candidate list ────────────────────────────────────────────
     tracks_path = DOA_DIR / "doa_tracks.json"
@@ -162,6 +215,26 @@ def main() -> None:
             continue
 
         enhanced_stft = np.load(str(stft_path))
+
+        # Spatial mask gating — suppress T-F bins where target mask is low
+        if use_mask_gate:
+            mask_path = INTERMEDIATE_DIR / f"{cid}_mask.npy"
+            if mask_path.exists():
+                mask = np.load(str(mask_path)).astype(np.float64)
+                pre_power = float(np.mean(np.abs(enhanced_stft) ** 2))
+                enhanced_stft = apply_spatial_mask_gate(
+                    enhanced_stft, mask,
+                    floor=mask_gate_floor,
+                    exponent=mask_gate_exponent,
+                )
+                post_power = float(np.mean(np.abs(enhanced_stft) ** 2))
+                ratio = post_power / (pre_power + 1e-12)
+                logger.info("[member2][export] %s: mask gate applied "
+                            "(floor=%.2f, exp=%.1f, power_ratio=%.3f)",
+                            cid, mask_gate_floor, mask_gate_exponent, ratio)
+            else:
+                logger.warning("[member2][export] %s: mask %s not found "
+                               "— skipping gate", cid, mask_path.name)
 
         # Post-filter
         filtered = apply_postfilter(enhanced_stft, method=postfilter)

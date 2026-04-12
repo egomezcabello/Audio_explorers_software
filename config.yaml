@@ -209,6 +209,14 @@ enhancement:
 
   postfilter: "wiener"                # Options: none, wiener, binary_mask
 
+  # Spatial mask gating — apply the DoA mask as a soft gate on the
+  # beamformed STFT to suppress crosstalk in T-F bins where the target
+  # mask is low.  This is critical for close-angular interferers that
+  # MVDR alone cannot fully reject (e.g. 45° apart on a 4-mic BTE).
+  use_spatial_mask_gate: true
+  mask_gate_floor: 0.05              # minimum gain (avoids total zeroing)
+  mask_gate_exponent: 1.0            # raise mask to this power for sharpening
+
 # ── Analysis ───────────────────────────────────────────────────────────
 analysis:
   vad_mode: 3
